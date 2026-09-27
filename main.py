@@ -70,10 +70,8 @@ def client_auth(authorization: str | None):
         raise HTTPException(401, "Invalid API key")
 
 def normalize_content(content: Any) -> list[dict]:
-    """Convert OpenAI-style message content to the native One AI format."""
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
-
     if not isinstance(content, list):
         return [{"type": "text", "text": str(content)}]
 
@@ -81,14 +79,11 @@ def normalize_content(content: Any) -> list[dict]:
     for part in content:
         if not isinstance(part, dict):
             continue
-
         part_type = part.get("type")
-
         if part_type == "text":
             text = part.get("text", "")
             if isinstance(text, str):
                 result.append({"type": "text", "text": text})
-
         elif part_type in ("image_url", "image"):
             image_url = part.get("image_url")
             if isinstance(image_url, dict):
@@ -97,9 +92,6 @@ def normalize_content(content: Any) -> list[dict]:
             else:
                 url = image_url
                 detail = "auto"
-
-            # Native One AI format observed in the APK:
-            # {"type":"image","image_url":{"detail":"auto","url":"..."}}
             if isinstance(url, str) and url:
                 result.append({
                     "type": "image",
@@ -108,16 +100,12 @@ def normalize_content(content: Any) -> list[dict]:
                         "url": url,
                     },
                 })
-
     return result or [{"type": "text", "text": ""}]
 
 def make_payload(req: ChatRequest) -> dict:
     return {
         "max_tokens": req.max_tokens,
-        "messages": [
-            {"role": m.role, "content": normalize_content(m.content)}
-            for m in req.messages
-        ],
+        "messages": [{"role": m.role, "content": normalize_content(m.content)} for m in req.messages],
         "model": req.model,
         "response_length": "",
         "response_tone": "default",
@@ -129,7 +117,7 @@ def make_payload(req: ChatRequest) -> dict:
 
 def parse_upstream(line: str) -> str | None:
     line = line.strip()
-    if not line:
+    if not line or line == "data: [DONE]":
         return None
     if line.startswith("data:"):
         line = line[5:].strip()
@@ -139,28 +127,17 @@ def parse_upstream(line: str) -> str | None:
         obj = json.loads(line)
     except json.JSONDecodeError:
         return line
-
-    # Native One AI stream format:
-    # {"statusCode":200,"message":"ok","data":{"content":"..."}}
     data = obj.get("data")
-    if isinstance(data, dict):
-        content = data.get("content")
-        if isinstance(content, str):
-            return content
-
-    # OpenAI-compatible format
+    if isinstance(data, dict) and isinstance(data.get("content"), str):
+        return data["content"]
     choices = obj.get("choices")
     if isinstance(choices, list) and choices:
         choice = choices[0]
         delta = choice.get("delta")
-        if isinstance(delta, dict):
-            content = delta.get("content")
-            if isinstance(content, str):
-                return content
-        text = choice.get("text")
-        if isinstance(text, str):
-            return text
-
+        if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+            return delta["content"]
+        if isinstance(choice.get("text"), str):
+            return choice["text"]
     return None
 
 def sse(obj: dict) -> bytes:
@@ -279,4 +256,5 @@ async def stream_upstream(request, payload, headers, completion_id, created) -> 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
