@@ -69,18 +69,53 @@ def client_auth(authorization: str | None):
     if scheme.lower() != "bearer" or not hmac.compare_digest(token, SERVER_API_KEY):
         raise HTTPException(401, "Invalid API key")
 
-def text_from_content(content: Any) -> str:
+def normalize_content(content: Any) -> list[dict]:
+    """Convert OpenAI-style message content to the native One AI format."""
     if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
-    return str(content)
+        return [{"type": "text", "text": content}]
+
+    if not isinstance(content, list):
+        return [{"type": "text", "text": str(content)}]
+
+    result = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+
+        part_type = part.get("type")
+
+        if part_type == "text":
+            text = part.get("text", "")
+            if isinstance(text, str):
+                result.append({"type": "text", "text": text})
+
+        elif part_type in ("image_url", "image"):
+            image_url = part.get("image_url")
+            if isinstance(image_url, dict):
+                url = image_url.get("url")
+                detail = image_url.get("detail", "auto")
+            else:
+                url = image_url
+                detail = "auto"
+
+            # Native One AI format observed in the APK:
+            # {"type":"image","image_url":{"detail":"auto","url":"..."}}
+            if isinstance(url, str) and url:
+                result.append({
+                    "type": "image",
+                    "image_url": {
+                        "detail": detail if isinstance(detail, str) else "auto",
+                        "url": url,
+                    },
+                })
+
+    return result or [{"type": "text", "text": ""}]
 
 def make_payload(req: ChatRequest) -> dict:
     return {
         "max_tokens": req.max_tokens,
         "messages": [
-            {"role": m.role, "content": [{"type": "text", "text": text_from_content(m.content)}]}
+            {"role": m.role, "content": normalize_content(m.content)}
             for m in req.messages
         ],
         "model": req.model,
