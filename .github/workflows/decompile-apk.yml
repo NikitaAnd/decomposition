@@ -1,0 +1,57 @@
+name: Decompile APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "GitHub Release tag"
+        required: true
+        default: "d"
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APK from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+        run: |
+          mkdir -p work
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.apk" --dir work
+          APK="$(find work -maxdepth 1 -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          echo "APK=$APK" >> "$GITHUB_ENV"
+
+      - name: Decode APK resources with Apktool
+        run: |
+          mkdir -p output/apktool
+          curl -L -o apktool.jar https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool.jar
+          java -jar apktool.jar d "$APK" -o output/apktool --force
+
+      - name: Decompile DEX with JADX
+        run: |
+          mkdir -p output/jadx
+          JADX_VERSION=1.5.2
+          curl -L -o jadx.zip "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"
+          unzip -q jadx.zip -d jadx
+          ./jadx/bin/jadx --deobf --show-bad-code -d output/jadx "$APK"
+
+      - name: Extract APK metadata
+        run: |
+          mkdir -p output/metadata
+          unzip -l "$APK" > output/metadata/apk-file-list.txt
+          sha256sum "$APK" > output/metadata/apk-sha256.txt
+          aapt2 dump badging "$APK" > output/metadata/aapt2-badging.txt || true
+
+      - name: Upload decompilation
+        uses: actions/upload-artifact@v4
+        with:
+          name: decompiled-apk
+          path: output/
+          retention-days: 7
