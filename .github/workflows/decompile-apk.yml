@@ -44,14 +44,25 @@ jobs:
           JADX_VERSION=1.5.2
           curl -fL -o jadx.zip "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"
           unzip -q jadx.zip -d jadx
+
+          set +e
           ./jadx/bin/jadx --deobf --show-bad-code -d output/jadx "$APK"
+          JADX_EXIT=$?
+          set -e
+
+          echo "JADX exit code: $JADX_EXIT" | tee output/jadx/JADX_STATUS.txt
+          echo "JADX can report decompilation errors for individual classes while still producing useful source output." >> output/jadx/JADX_STATUS.txt
+
+          if [ "$JADX_EXIT" -ne 0 ]; then
+            echo "WARNING: JADX finished with errors; preserving all generated output."
+          fi
 
       - name: Extract APK metadata
         run: |
           mkdir -p output/metadata
           unzip -l "$APK" > output/metadata/apk-file-list.txt
           sha256sum "$APK" > output/metadata/apk-sha256.txt
-          unzip -p "$APK" AndroidManifest.xml > output/metadata/AndroidManifest.bin || true
+          cp output/apktool/AndroidManifest.xml output/metadata/AndroidManifest.xml || true
 
       - name: Upload decompilation
         uses: actions/upload-artifact@v4
