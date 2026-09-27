@@ -104,21 +104,28 @@ def parse_upstream(line: str) -> str | None:
         obj = json.loads(line)
     except json.JSONDecodeError:
         return line
+
+    # Native One AI stream format:
+    # {"statusCode":200,"message":"ok","data":{"content":"..."}}
+    data = obj.get("data")
+    if isinstance(data, dict):
+        content = data.get("content")
+        if isinstance(content, str):
+            return content
+
+    # OpenAI-compatible format
     choices = obj.get("choices")
     if isinstance(choices, list) and choices:
-        c = choices[0]
-        if isinstance(c.get("delta"), dict) and isinstance(c["delta"].get("content"), str):
-            return c["delta"]["content"]
-        if isinstance(c.get("text"), str):
-            return c["text"]
-    for key in ("content", "text", "answer", "delta", "message"):
-        value = obj.get(key)
-        if isinstance(value, str):
-            return value
-        if isinstance(value, dict):
-            for nested in ("content", "text", "delta"):
-                if isinstance(value.get(nested), str):
-                    return value[nested]
+        choice = choices[0]
+        delta = choice.get("delta")
+        if isinstance(delta, dict):
+            content = delta.get("content")
+            if isinstance(content, str):
+                return content
+        text = choice.get("text")
+        if isinstance(text, str):
+            return text
+
     return None
 
 def sse(obj: dict) -> bytes:
