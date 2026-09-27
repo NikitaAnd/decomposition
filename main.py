@@ -1,4 +1,5 @@
 import os, json, time, uuid, hmac, hashlib, base64
+from datetime import datetime
 from typing import Any, AsyncIterator
 
 import httpx
@@ -12,7 +13,6 @@ UPSTREAM_SECRET = os.getenv("UPSTREAM_SECRET", "stteam-ikameglobal-chatapiopenai
 APP_ID = os.getenv("APP_ID", "com.chat.chatai.chatbot.aichatbot")
 APP_VERSION = os.getenv("APP_VERSION", "1.5.3")
 ANDROID_VERSION = os.getenv("ANDROID_VERSION", "16")
-TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 SERVER_API_KEY = os.getenv("SERVER_API_KEY", "")
 DEVICE_ID = os.getenv("DEVICE_ID", uuid.uuid4().hex.upper())
 UPSTREAM_USER_ID = os.getenv("UPSTREAM_USER_ID", "")
@@ -47,7 +47,7 @@ def make_jwt() -> str:
         "bundleId": APP_ID,
         "os": "Android",
         "versionApp": APP_VERSION,
-        "timezone": TIMEZONE,
+        "timezone": datetime.now().astimezone().tzinfo.tzname(None),
     }
     h = b64url(json.dumps(header, separators=(",", ":")).encode())
     p = b64url(json.dumps(payload, separators=(",", ":")).encode())
@@ -56,7 +56,6 @@ def make_jwt() -> str:
 
 def make_user_header() -> str:
     return (
-        'id="igx4wy" '
         f"bundleId:{APP_ID}/versionApp:{APP_VERSION}/OS:Android/"
         f"osVersion:{ANDROID_VERSION}/userId:{UPSTREAM_USER_ID}/deviceId:{DEVICE_ID}"
     )
