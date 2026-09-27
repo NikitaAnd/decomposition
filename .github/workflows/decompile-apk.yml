@@ -28,17 +28,21 @@ jobs:
           test -n "$APK"
           echo "APK=$APK" >> "$GITHUB_ENV"
 
+      - name: Install Apktool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apktool
+
       - name: Decode APK resources with Apktool
         run: |
           mkdir -p output/apktool
-          curl -L -o apktool.jar https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool.jar
-          java -jar apktool.jar d "$APK" -o output/apktool --force
+          apktool d "$APK" -o output/apktool --force
 
       - name: Decompile DEX with JADX
         run: |
           mkdir -p output/jadx
           JADX_VERSION=1.5.2
-          curl -L -o jadx.zip "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"
+          curl -fL -o jadx.zip "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"
           unzip -q jadx.zip -d jadx
           ./jadx/bin/jadx --deobf --show-bad-code -d output/jadx "$APK"
 
@@ -47,7 +51,7 @@ jobs:
           mkdir -p output/metadata
           unzip -l "$APK" > output/metadata/apk-file-list.txt
           sha256sum "$APK" > output/metadata/apk-sha256.txt
-          aapt2 dump badging "$APK" > output/metadata/aapt2-badging.txt || true
+          unzip -p "$APK" AndroidManifest.xml > output/metadata/AndroidManifest.bin || true
 
       - name: Upload decompilation
         uses: actions/upload-artifact@v4
