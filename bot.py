@@ -132,7 +132,8 @@ def telegram_image_to_data_url(data: bytes) -> str:
         output = BytesIO()
         image.save(output, format="JPEG", quality=82, optimize=True)
         encoded = base64.b64encode(output.getvalue()).decode("ascii")
-    return "data:image/jpeg;base64," + encoded
+    # Native One AI wraps the JPEG base64 payload in braces.
+    return "data:image/jpeg;base64,{" + encoded + "}"
 
 
 async def download_photo(message: Message) -> str:
