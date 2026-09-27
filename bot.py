@@ -47,29 +47,65 @@ async def ask_ai(user_id, content):
     return answer
 
 
+def markdown_to_telegram(text: str) -> str:
+    """Convert common Markdown produced by GPT to Telegram MarkdownV2."""
+    text = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
+    protected = []
+
+    def protect(match):
+        protected.append(match.group(0))
+        return "@@TGPROTECT{}@@".format(len(protected) - 1)
+
+    text = re.sub(r"```[\\s\\S]*?```", protect, text)
+    text = re.sub(r"`[^\\n`]+`", protect, text)
+    text = re.sub(r"(?m)^\\s*#{1,6}\\s+(.+?)\\s*$", r"*\\1*", text)
+    text = re.sub(r"\\*\\*(.+?)\\*\\*", r"*\\1*", text)
+    text = re.sub(r"~~(.+?)~~", r"~\\1~", text)
+    text = re.sub(r"\\[([^\\]]+)\\]\\((https?://[^\\s)]+)\\)", r"[\\1](\\2)", text)
+
+    out = []
+    i = 0
+    while i < len(text):
+        if text.startswith("@@TGPROTECT", i):
+            m = re.match(r"@@TGPROTECT(\\d+)@@", text[i:])
+            if m:
+                out.append(protected[int(m.group(1))])
+                i += len(m.group(0))
+                continue
+        ch = text[i]
+        if ch in "[]()~`>#+-=|{}.!":
+            out.append("\\\\" + ch)
+        else:
+            out.append(ch)
+        i += 1
+
+    result = "".join(out)
+    result = result.replace("\\\\*", "*").replace("\\\\_", "_").replace("\\\\~", "~")
+    return result
+
+
 async def send_ai_answer(message: Message, answer: str):
-    """Send AI MarkdownV2 with safe fallback and Telegram's 4096-char limit."""
-    answer = str(answer).replace("\r\n", "\n").replace("\r", "\n")
-    answer = re.sub(r"(?m)^#{1,6}\s+(.+)$", r"*\1*", answer)
+    """Convert GPT Markdown to Telegram MarkdownV2 and safely send long answers."""
+    converted = markdown_to_telegram(answer)
     chunks = []
-    while len(answer) > 4096:
-        cut = answer.rfind("\n", 0, 4096)
+    while len(converted) > 4096:
+        cut = converted.rfind("\n", 0, 4096)
         if cut < 2048:
-            cut = answer.rfind(" ", 0, 4096)
+            cut = converted.rfind(" ", 0, 4096)
         if cut < 2048:
             cut = 4096
-        chunks.append(answer[:cut].rstrip())
-        answer = answer[cut:].lstrip()
-    if answer:
-        chunks.append(answer)
+        chunks.append(converted[:cut].rstrip())
+        converted = converted[cut:].lstrip()
+    if converted:
+        chunks.append(converted)
+
     for chunk in chunks or [""]:
         try:
             await message.answer(chunk, parse_mode="MarkdownV2", reply_markup=keyboard())
         except Exception:
             logging.exception("MarkdownV2 failed; sending plain text")
-            plain = re.sub(r"[*_~\` ]", "", chunk)
+            plain = re.sub(r"[*_~`]", "", chunk)
             await message.answer(plain, reply_markup=keyboard())
-
 
 def telegram_image_to_data_url(data: bytes) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
