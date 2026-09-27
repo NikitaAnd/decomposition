@@ -140,6 +140,30 @@ async def models(authorization: str | None = Header(default=None)):
         for m in ["gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o-mini", "deepseek"]
     ]}
 
+@app.post("/debug/upstream")
+async def debug_upstream(request: ChatRequest, authorization: str | None = Header(default=None)):
+    client_auth(authorization)
+    if not request.messages:
+        raise HTTPException(400, "messages cannot be empty")
+    payload = make_payload(request)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {make_jwt()}",
+        "user-header": make_user_header(),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            response = await client.post(UPSTREAM_BASE + UPSTREAM_ENDPOINT, json=payload, headers=headers)
+            return {
+                "upstream_status": response.status_code,
+                "upstream_headers": dict(response.headers),
+                "upstream_body": response.text[:20000],
+                "request_payload": payload,
+                "request_headers": {**headers, "Authorization": "Bearer [redacted]"},
+            }
+    except Exception as exc:
+        raise HTTPException(502, f"Upstream request failed: {exc}")
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest, authorization: str | None = Header(default=None)):
     client_auth(authorization)
