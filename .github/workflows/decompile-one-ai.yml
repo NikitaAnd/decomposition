@@ -1,0 +1,127 @@
+name: Decompile One AI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download APK
+        run: |
+          set -euxo pipefail
+          curl -L --fail --retry 3 \
+            -o app.apk \
+            'https://github.com/NikitaAnd/decomposition/releases/download/d/One%2BAI%2BPro%2B1.5.3-%40EasyAPK.apk'
+          sha256sum app.apk
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install JADX
+        run: |
+          set -euxo pipefail
+          curl -L --fail --retry 3 \
+            -o jadx.zip \
+            'https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip'
+          unzip -q jadx.zip -d /opt/jadx
+
+      - name: Install Apktool
+        run: |
+          set -euxo pipefail
+          curl -L --fail --retry 3 \
+            -o /usr/local/bin/apktool.jar \
+            'https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar'
+          cat > /usr/local/bin/apktool <<'EOF'
+          #!/bin/sh
+          exec java -jar /usr/local/bin/apktool.jar "$@"
+          EOF
+          chmod +x /usr/local/bin/apktool
+
+      - name: Decompile with JADX
+        run: |
+          set -euxo pipefail
+          /opt/jadx/bin/jadx --deobf --show-bad-code -d jadx-out app.apk || true
+
+      - name: Decode with Apktool
+        run: |
+          set -euxo pipefail
+          apktool d -f app.apk -o apktool-out || true
+
+      - name: Extract authentication/API evidence
+        run: |
+          set -uo pipefail
+          mkdir -p report
+
+          {
+            echo '===== APK SHA256 ====='
+            sha256sum app.apk
+            echo
+            echo '===== JADX matching files ====='
+            find jadx-out -type f \
+              \( -iname '*ApiKey*' -o -iname '*AuthInterceptor*' -o -iname '*ChatRequest*' \) \
+              -print 2>/dev/null || true
+            echo
+            echo '===== JADX source matches ====='
+            grep -RniE \
+              --include='*.java' --include='*.kt' --include='*.smali' \
+              'ApiKeyFactory|AuthInterceptor|ChatRequest|/api/v3/chat/stream|api-key|x-api-key|authorization|Bearer|JWT|HS256|chat-ai\.begamob\.com|stteam-ikameglobal-chatapiopenai' \
+              jadx-out 2>/dev/null > report/jadx-matches.txt || true
+
+            echo
+            echo '===== APKTOOL source matches ====='
+            grep -RniE \
+              'ApiKeyFactory|AuthInterceptor|ChatRequest|/api/v3/chat/stream|api-key|x-api-key|authorization|Bearer|JWT|HS256|chat-ai\.begamob\.com|stteam-ikameglobal-chatapiopenai' \
+              apktool-out 2>/dev/null > report/apktool-matches.txt || true
+
+            echo
+            echo '===== URLs ====='
+            grep -RhoE 'https?://[^"'"'"'[:space:]<>]+' jadx-out apktool-out 2>/dev/null \
+              | sort -u > report/urls.txt || true
+            cat report/urls.txt
+          } | tee report/summary.txt
+
+      - name: Copy matching source files
+        run: |
+          set -e
+          mkdir -p report/source-files
+          while IFS=: read -r file line rest; do
+            [ -f "$file" ] || continue
+            dest="report/source-files/$(echo "$file" | tr '/' '_')"
+            cp "$file" "$dest" || true
+          done < report/jadx-matches.txt || true
+
+      - name: Package results
+        run: |
+          set -e
+          cp report/summary.txt report/README.txt
+          zip -qr decompile-report.zip report
+          zip -qr decompiled-jadx.zip jadx-out
+          zip -qr decompiled-apktool.zip apktool-out
+
+      - name: Upload focused report
+        uses: actions/upload-artifact@v4
+        with:
+          name: one-ai-api-report
+          path: decompile-report.zip
+          retention-days: 7
+
+      - name: Upload JADX
+        uses: actions/upload-artifact@v4
+        with:
+          name: one-ai-jadx
+          path: decompiled-jadx.zip
+          retention-days: 7
+
+      - name: Upload Apktool
+        uses: actions/upload-artifact@v4
+        with:
+          name: one-ai-apktool
+          path: decompiled-apktool.zip
+          retention-days: 7
