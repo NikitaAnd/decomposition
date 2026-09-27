@@ -47,40 +47,59 @@ async def ask_ai(user_id, content):
     return answer
 
 
+def escape_plain(value: str) -> str:
+    reserved = r"_*[]()~`>#+-=|{}.!\\"
+    return "".join("\\" + ch if ch in reserved else ch for ch in str(value))
+
+
 def markdown_to_telegram(text: str) -> str:
     """Convert common Markdown produced by GPT to Telegram MarkdownV2."""
     text = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
     protected = []
 
-    def protect(match):
-        protected.append(match.group(0))
+    def protect_code(match):
+        protected.append(("code", match.group(1)))
         return "@@TGPROTECT{}@@".format(len(protected) - 1)
 
-    text = re.sub(r"```[\\s\\S]*?```", protect, text)
-    text = re.sub(r"`[^\\n`]+`", protect, text)
-    text = re.sub(r"(?m)^\\s*#{1,6}\\s+(.+?)\\s*$", r"*\\1*", text)
-    text = re.sub(r"\\*\\*(.+?)\\*\\*", r"*\\1*", text)
-    text = re.sub(r"~~(.+?)~~", r"~\\1~", text)
-    text = re.sub(r"\\[([^\\]]+)\\]\\((https?://[^\\s)]+)\\)", r"[\\1](\\2)", text)
+    text = re.sub(r"```(?:[^\n]*)\n([\s\S]*?)```", protect_code, text)
+    text = re.sub(r"`([^`\n]+)`", protect_code, text)
 
+    def protect_link(match):
+        protected.append(("link", match.group(1), match.group(2)))
+        return "@@TGPROTECT{}@@".format(len(protected) - 1)
+
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", protect_link, text)
+    text = re.sub(r"(?m)^\s*#{1,6}\s+(.+?)\s*$", r"*\1*", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+    text = re.sub(r"__(.+?)__", r"*\1*", text)
+    text = re.sub(r"~~(.+?)~~", r"~\1~", text)
+
+    reserved = r"_*[]()~`>#+-=|{}.!\\"
     out = []
     i = 0
     while i < len(text):
         if text.startswith("@@TGPROTECT", i):
-            m = re.match(r"@@TGPROTECT(\\d+)@@", text[i:])
+            m = re.match(r"@@TGPROTECT(\d+)@@", text[i:])
             if m:
-                out.append(protected[int(m.group(1))])
+                value = protected[int(m.group(1))]
+                if value[0] == "link":
+                    label = escape_plain(value[1])
+                    url = value[2].replace("\\", "\\\\").replace(")", "\\)")
+                    out.append("[{}]({})".format(label, url))
+                else:
+                    code = value[1].replace("\\", "\\\\").replace("`", "\\`")
+                    out.append("`{}`".format(code))
                 i += len(m.group(0))
                 continue
         ch = text[i]
-        if ch in "[]()~`>#+-=|{}.!":
-            out.append("\\\\" + ch)
+        if ch in reserved:
+            out.append("\\" + ch)
         else:
             out.append(ch)
         i += 1
 
     result = "".join(out)
-    result = result.replace("\\\\*", "*").replace("\\\\_", "_").replace("\\\\~", "~")
+    result = result.replace(r"\*", "*").replace(r"\~", "~").replace(r"\_", "_")
     return result
 
 
@@ -98,15 +117,12 @@ async def send_ai_answer(message: Message, answer: str):
         converted = converted[cut:].lstrip()
     if converted:
         chunks.append(converted)
-
     for chunk in chunks or [""]:
         try:
             await message.answer(chunk, parse_mode="MarkdownV2", reply_markup=keyboard())
         except Exception:
             logging.exception("MarkdownV2 failed; sending plain text")
-            plain = re.sub(r"[*_~`]", "", chunk)
-            await message.answer(plain, reply_markup=keyboard())
-
+            await message.answer(re.sub(r"[*_~`]", "", chunk), reply_markup=keyboard())
 def telegram_image_to_data_url(data: bytes) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
 
