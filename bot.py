@@ -1,5 +1,6 @@
 import os, asyncio, logging, base64, re
 from io import BytesIO
+from PIL import Image
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -124,7 +125,14 @@ async def send_ai_answer(message: Message, answer: str):
             logging.exception("MarkdownV2 failed; sending plain text")
             await message.answer(re.sub(r"[*_~`]", "", chunk), reply_markup=keyboard())
 def telegram_image_to_data_url(data: bytes) -> str:
-    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+    source = BytesIO(data)
+    with Image.open(source) as image:
+        image = image.convert("RGB")
+        image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=82, optimize=True)
+        encoded = base64.b64encode(output.getvalue()).decode("ascii")
+    return "data:image/jpeg;base64," + encoded
 
 
 async def download_photo(message: Message) -> str:
