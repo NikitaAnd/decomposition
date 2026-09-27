@@ -1,4 +1,4 @@
-import os, json, time, uuid, hmac, hashlib, base64
+import os, json, time, uuid, hmac, hashlib, base64, logging
 from datetime import datetime
 from typing import Any, AsyncIterator
 
@@ -6,6 +6,9 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("one-ai-proxy")
 
 UPSTREAM_BASE = os.getenv("UPSTREAM_BASE", "https://chat-ai.begamob.com").rstrip("/")
 UPSTREAM_ENDPOINT = "/api/v3/chat/stream"
@@ -109,11 +112,19 @@ def make_payload(req: ChatRequest) -> dict:
         "model": req.model,
         "response_length": "",
         "response_tone": "default",
+        "response_tone": "default",
         "topic_type": "",
         "image_and_analytic": True,
         "tools": [],
         "is_image_vip": False,
     }
+
+def payload_has_image(payload: dict) -> bool:
+    return any(
+        isinstance(m.get("content"), list)
+        and any(isinstance(p, dict) and p.get("type") == "image" for p in m["content"])
+        for m in payload.get("messages", [])
+    )
 
 def parse_upstream(line: str) -> str | None:
     line = line.strip()
@@ -165,23 +176,30 @@ async def debug_upstream(request: ChatRequest, authorization: str | None = Heade
     if not request.messages:
         raise HTTPException(400, "messages cannot be empty")
     payload = make_payload(request)
+    has_image = payload_has_image(payload)
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {make_jwt()}",
         "user-header": make_user_header(),
     }
+    log.info("DEBUG upstream request: image=%s payload_bytes=%d", has_image, len(json.dumps(payload, ensure_ascii=False).encode()))
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             response = await client.post(UPSTREAM_BASE + UPSTREAM_ENDPOINT, json=payload, headers=headers)
+            body = response.text[:20000]
+            log.info("DEBUG upstream response: image=%s status=%s content_type=%s body=%s", has_image, response.status_code, response.headers.get("content-type"), body[:4000])
             return {
                 "upstream_status": response.status_code,
-                "upstream_headers": dict(response.headers),
-                "upstream_body": response.text[:20000],
+                "upstream_content_type": response.headers.get("content-type"),
+                "upstream_body": body,
+                "request_has_image": has_image,
+                "request_payload_bytes": len(json.dumps(payload, ensure_ascii=False).encode()),
                 "request_payload": payload,
                 "request_headers": {**headers, "Authorization": "Bearer [redacted]"},
             }
     except Exception as exc:
-        raise HTTPException(502, f"Upstream request failed: {exc}")
+        log.exception("DEBUG upstream exception: image=%s", has_image)
+        raise HTTPException(502, f"Upstream request failed: {type(exc).__name__}: {exc}")
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest, authorization: str | None = Header(default=None)):
@@ -189,6 +207,7 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
     if not request.messages:
         raise HTTPException(400, "messages cannot be empty")
     payload = make_payload(request)
+    has_image = payload_has_image(payload)
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
@@ -197,6 +216,7 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
     }
     completion_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
+    log.info("chat request: image=%s stream=%s payload_bytes=%d", has_image, request.stream, len(json.dumps(payload, ensure_ascii=False).encode()))
 
     if request.stream:
         return StreamingResponse(
@@ -209,9 +229,12 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             async with client.stream("POST", UPSTREAM_BASE + UPSTREAM_ENDPOINT, json=payload, headers=headers) as response:
+                log.info("upstream opened: image=%s status=%s content_type=%s", has_image, response.status_code, response.headers.get("content-type"))
                 if response.status_code >= 400:
                     body = await response.aread()
-                    raise HTTPException(502, f"Upstream HTTP {response.status_code}: {body.decode(errors='replace')[:2000]}")
+                    body_text = body.decode(errors="replace")[:4000]
+                    log.error("upstream HTTP error: image=%s status=%s body=%s", has_image, response.status_code, body_text)
+                    raise HTTPException(502, f"Upstream HTTP {response.status_code}: {body_text}")
                 async for line in response.aiter_lines():
                     text = parse_upstream(line)
                     if text:
@@ -219,7 +242,8 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(502, f"Upstream request failed: {exc}")
+        log.exception("upstream exception: image=%s", has_image)
+        raise HTTPException(502, f"Upstream request failed: {type(exc).__name__}: {exc}")
 
     return {
         "id": completion_id, "object": "chat.completion", "created": created, "model": request.model,
@@ -227,6 +251,7 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
     }
 
 async def stream_upstream(request, payload, headers, completion_id, created) -> AsyncIterator[bytes]:
+    has_image = payload_has_image(payload)
     yield sse({
         "id": completion_id, "object": "chat.completion.chunk", "created": created, "model": request.model,
         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
@@ -234,9 +259,12 @@ async def stream_upstream(request, payload, headers, completion_id, created) -> 
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             async with client.stream("POST", UPSTREAM_BASE + UPSTREAM_ENDPOINT, json=payload, headers=headers) as response:
+                log.info("stream upstream opened: image=%s status=%s content_type=%s", has_image, response.status_code, response.headers.get("content-type"))
                 if response.status_code >= 400:
                     body = await response.aread()
-                    yield sse({"error": {"message": f"Upstream HTTP {response.status_code}: {body.decode(errors='replace')[:2000]}", "type": "upstream_error"}})
+                    body_text = body.decode(errors="replace")[:4000]
+                    log.error("stream upstream HTTP error: image=%s status=%s body=%s", has_image, response.status_code, body_text)
+                    yield sse({"error": {"message": f"Upstream HTTP {response.status_code}: {body_text}", "type": "upstream_error"}})
                     yield b"data: [DONE]\n\n"
                     return
                 async for line in response.aiter_lines():
@@ -247,7 +275,8 @@ async def stream_upstream(request, payload, headers, completion_id, created) -> 
                             "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
                         })
     except Exception as exc:
-        yield sse({"error": {"message": str(exc), "type": "proxy_error"}})
+        log.exception("stream upstream exception: image=%s", has_image)
+        yield sse({"error": {"message": f"{type(exc).__name__}: {exc}", "type": "proxy_error"}})
     yield sse({
         "id": completion_id, "object": "chat.completion.chunk", "created": created, "model": request.model,
         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
