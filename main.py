@@ -96,8 +96,15 @@ def normalize_content(content: Any) -> list[dict]:
                 url = image_url
                 detail = "auto"
             if isinstance(url, str) and url:
+                # Native One AI uses "image_url" as the content discriminator.
+                # Its Android client also wraps JPEG base64 as data:image/jpeg;base64,{...}.
+                if isinstance(url, str) and url.startswith("data:image/jpeg;base64,"):
+                    prefix, encoded = url.split(",", 1)
+                    if not (encoded.startswith("{") and encoded.endswith("}")):
+                        url = prefix + ",{" + encoded + "}"
                 result.append({
-                    "type": "image",
+                    "type": "image_url",
+                    "text": None,
                     "image_url": {
                         "detail": detail if isinstance(detail, str) else "auto",
                         "url": url,
@@ -112,7 +119,6 @@ def make_payload(req: ChatRequest) -> dict:
         "model": req.model,
         "response_length": "",
         "response_tone": "default",
-        "response_tone": "default",
         "topic_type": "",
         "image_and_analytic": True,
         "tools": [],
@@ -122,7 +128,7 @@ def make_payload(req: ChatRequest) -> dict:
 def payload_has_image(payload: dict) -> bool:
     return any(
         isinstance(m.get("content"), list)
-        and any(isinstance(p, dict) and p.get("type") == "image" for p in m["content"])
+        and any(isinstance(p, dict) and p.get("type") == "image_url" for p in m["content"])
         for m in payload.get("messages", [])
     )
 
