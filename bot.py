@@ -1,4 +1,5 @@
-import os, asyncio, logging
+import os, asyncio, logging, base64, re
+from io import BytesIO
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -45,6 +46,42 @@ async def ask_ai(user_id, content):
     clean_context(user_id)
     return answer
 
+
+async def send_ai_answer(message: Message, answer: str):
+    """Send AI MarkdownV2 with safe fallback and Telegram's 4096-char limit."""
+    answer = str(answer).replace("\r\n", "\n").replace("\r", "\n")
+    answer = re.sub(r"(?m)^#{1,6}\s+(.+)$", r"*\1*", answer)
+    chunks = []
+    while len(answer) > 4096:
+        cut = answer.rfind("\n", 0, 4096)
+        if cut < 2048:
+            cut = answer.rfind(" ", 0, 4096)
+        if cut < 2048:
+            cut = 4096
+        chunks.append(answer[:cut].rstrip())
+        answer = answer[cut:].lstrip()
+    if answer:
+        chunks.append(answer)
+    for chunk in chunks or [""]:
+        try:
+            await message.answer(chunk, parse_mode="MarkdownV2", reply_markup=keyboard())
+        except Exception:
+            logging.exception("MarkdownV2 failed; sending plain text")
+            plain = re.sub(r"[*_~\` ]", "", chunk)
+            await message.answer(plain, reply_markup=keyboard())
+
+
+def telegram_image_to_data_url(data: bytes) -> str:
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+
+
+async def download_photo(message: Message) -> str:
+    photo = message.photo[-1]
+    telegram_file = await bot.get_file(photo.file_id)
+    buffer = BytesIO()
+    await bot.download(telegram_file, destination=buffer)
+    return telegram_image_to_data_url(buffer.getvalue())
+
 @dp.message(CommandStart())
 async def start(message: Message):
     contexts[message.from_user.id].clear()
@@ -73,12 +110,29 @@ async def help_cmd(message: Message):
         parse_mode="HTML", reply_markup=keyboard()
     )
 
+@dp.message(F.photo)
+async def photo_message(message: Message):
+    try:
+        await bot.send_chat_action(message.chat.id, "typing")
+        image_url = await download_photo(message)
+        caption = message.caption or "Проанализируй это изображение."
+        content = [
+            {"type": "text", "text": caption},
+            {"type": "image_url", "image_url": {"url": image_url, "detail": "auto"}},
+        ]
+        answer = await ask_ai(message.from_user.id, content)
+        await send_ai_answer(message, answer)
+    except Exception as e:
+        logging.exception("Image AI request failed")
+        await message.answer(f"❌ Ошибка: {e}", reply_markup=keyboard())
+
+
 @dp.message(F.text)
 async def text_message(message: Message):
     try:
         await bot.send_chat_action(message.chat.id, "typing")
         answer = await ask_ai(message.from_user.id, message.text)
-        await message.answer(answer, reply_markup=keyboard())
+        await send_ai_answer(message, answer)
     except Exception as e:
         logging.exception("AI request failed")
         await message.answer(f"❌ Ошибка: {e}", reply_markup=keyboard())
