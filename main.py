@@ -213,15 +213,11 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
     if not request.messages:
         raise HTTPException(400, "messages cannot be empty")
 
-    # One AI exposes an SSE endpoint. We consume it internally and expose only
-    # a normal OpenAI-compatible JSON response to clients.
     payload = make_payload(request)
     has_image = payload_has_image(payload)
     completion_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
-    parts: list[str] = []
-    upstream_completed = False
-    last_error: Exception | None = None
+    timeout = httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=30.0)
 
     log.info(
         "chat request: image=%s requested_stream=%s payload_bytes=%d",
@@ -230,106 +226,160 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
         len(json.dumps(payload, ensure_ascii=False).encode()),
     )
 
-    timeout = httpx.Timeout(connect=20.0, read=75.0, write=30.0, pool=30.0)
+    async def upstream_stream() -> AsyncIterator[str]:
+        """Forward upstream One AI SSE as OpenAI-compatible SSE."""
+        for attempt in range(1, 4):
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Authorization": f"Bearer {make_jwt()}",
+                "user-header": make_user_header(),
+            }
 
-    # The upstream occasionally kills an otherwise valid SSE connection at
-    # about 60 seconds before sending any data. Retry the complete request
-    # with a fresh JWT instead of immediately returning 502.
-    for attempt in range(1, 4):
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Authorization": f"Bearer {make_jwt()}",
-            "user-header": make_user_header(),
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream(
-                    "POST",
-                    UPSTREAM_BASE + UPSTREAM_ENDPOINT,
-                    json=payload,
-                    headers=headers,
-                ) as response:
-                    log.info(
-                        "upstream opened: attempt=%d image=%s status=%s content_type=%s",
-                        attempt,
-                        has_image,
-                        response.status_code,
-                        response.headers.get("content-type"),
-                    )
-
-                    if response.status_code >= 400:
-                        body = await response.aread()
-                        body_text = body.decode(errors="replace")[:4000]
-                        log.error(
-                            "upstream HTTP error: attempt=%d status=%s body=%s",
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    async with client.stream(
+                        "POST",
+                        UPSTREAM_BASE + UPSTREAM_ENDPOINT,
+                        json=payload,
+                        headers=headers,
+                    ) as response:
+                        log.info(
+                            "upstream opened: attempt=%d image=%s status=%s content_type=%s",
                             attempt,
+                            has_image,
                             response.status_code,
-                            body_text,
-                        )
-                        if attempt < 3:
-                            continue
-                        raise HTTPException(
-                            502,
-                            f"Upstream HTTP {response.status_code}: {body_text}",
+                            response.headers.get("content-type"),
                         )
 
-                    async for line in response.aiter_lines():
-                        stripped = line.strip()
-                        if stripped in ("data: [DONE]", "[DONE]"):
-                            upstream_completed = True
-                            continue
+                        if response.status_code >= 400:
+                            body = await response.aread()
+                            body_text = body.decode(errors="replace")[:4000]
+                            log.error(
+                                "upstream HTTP error: attempt=%d status=%s body=%s",
+                                attempt,
+                                response.status_code,
+                                body_text,
+                            )
+                            if attempt < 3:
+                                await __import__("asyncio").sleep(1.0)
+                                continue
+                            raise HTTPException(
+                                502,
+                                f"Upstream HTTP {response.status_code}: {body_text}",
+                            )
 
-                        text = parse_upstream(line)
-                        if text:
-                            parts.append(text)
+                        async for line in response.aiter_lines():
+                            stripped = line.strip()
+                            if not stripped:
+                                continue
 
-                    upstream_completed = True
-                    break
+                            if stripped in ("data: [DONE]", "[DONE]"):
+                                yield "data: [DONE]\n\n"
+                                log.info("upstream completed: image=%s", has_image)
+                                return
 
-        except HTTPException:
-            raise
-        except Exception as exc:
-            last_error = exc
-            content_so_far = "".join(parts)
+                            text = parse_upstream(line)
+                            if text:
+                                yield (
+                                    "data: "
+                                    + json.dumps(
+                                        {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created,
+                                            "model": request.model,
+                                            "choices": [
+                                                {
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "role": "assistant",
+                                                        "content": text,
+                                                    },
+                                                    "finish_reason": None,
+                                                }
+                                            ],
+                                        },
+                                        ensure_ascii=False,
+                                        separators=(",", ":"),
+                                    )
+                                    + "\n\n"
+                                )
 
-            # If content was received, preserve it. If nothing was received,
-            # retry because this is the exact failure mode seen from the
-            # upstream: incomplete chunked read after ~60 seconds.
-            if content_so_far:
+                        # Some upstream responses may close without an explicit
+                        # [DONE]. Signal completion to OpenAI-compatible clients.
+                        yield (
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": request.model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {},
+                                            "finish_reason": "stop",
+                                        }
+                                    ],
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            + "\n\n"
+                        )
+                        yield "data: [DONE]\n\n"
+                        return
+
+            except HTTPException:
+                raise
+            except Exception as exc:
                 log.warning(
-                    "upstream ended early after %d chars on attempt %d; returning partial response: %s",
-                    len(content_so_far),
+                    "upstream attempt %d/%d failed: %s",
                     attempt,
+                    3,
                     exc,
                 )
-                break
+                if attempt < 3:
+                    await __import__("asyncio").sleep(1.0)
+                    continue
+                raise HTTPException(
+                    502,
+                    f"Upstream request failed: {type(exc).__name__}: {exc}",
+                )
 
-            log.warning(
-                "upstream attempt %d/%d failed with no content: %s",
-                attempt,
-                3,
-                exc,
-            )
-            if attempt < 3:
-                await __import__("asyncio").sleep(1.0)
+    if request.stream:
+        return StreamingResponse(
+            upstream_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # Non-streaming OpenAI-compatible response.
+    parts: list[str] = []
+
+    async for event in upstream_stream():
+        if event.startswith("data: ") and event.strip() != "data: [DONE]":
+            try:
+                obj = json.loads(event[6:])
+                choices = obj.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    text = delta.get("content")
+                    if isinstance(text, str):
+                        parts.append(text)
+            except json.JSONDecodeError:
                 continue
 
     content = "".join(parts)
     if not content:
-        error_text = f"{type(last_error).__name__}: {last_error}" if last_error else "empty upstream response"
-        log.error("upstream returned no assistant content after retries: %s", error_text)
-        raise HTTPException(502, f"Upstream request failed: {error_text}")
-
-    finish_reason = "stop" if upstream_completed else "length"
-    log.info(
-        "chat completed: image=%s chars=%d upstream_completed=%s",
-        has_image,
-        len(content),
-        upstream_completed,
-    )
+        raise HTTPException(502, "Upstream returned no assistant content")
 
     return {
         "id": completion_id,
@@ -339,7 +389,7 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": content},
-            "finish_reason": finish_reason,
+            "finish_reason": "stop",
         }],
     }
 
