@@ -40,6 +40,10 @@ async def fetch_news():
         k=hashlib.sha256(link.encode()).hexdigest()[:32]
         if posted(k): continue
         imgs=re.findall(r'<img[^>]+(?:src|data-src)=["\']([^"\']+)',desc_raw,re.I)
+        for tag in list(x):
+            if tag.tag.lower().endswith(("content","thumbnail","enclosure")):
+                u=tag.attrib.get("url") or tag.attrib.get("href")
+                if u: imgs.append(u)
         out.append({"key":k,"title":title,"url":link,"description":clean(desc_raw)[:1800],"date":x.findtext("pubDate") or "","image_urls":[html.unescape(u) for u in imgs],"images":[]})
         if len(out)>=max(40,NEWS_LIMIT): break
     return out
@@ -116,7 +120,7 @@ async def ai(items):
 Картинка:
 — image_id должен указывать на реальную фотографию из списка images выбранной новости.
 — Выбирай фотографию, которая максимально связана с событием, а не логотип или баннер.
-— Если у новости нет images, image_id поставь 0; бот сам найдёт фото отдельным поиском.
+— Выбирай только новости, у которых есть хотя бы одна реальная фотография в images.
 — Никогда не выбирай несуществующий image_id.
 
 КАНДИДАТЫ:
@@ -143,56 +147,6 @@ async def ai(items):
     return json.loads(m.group())
 
 
-async def ai_image_query(title, description):
-    prompt = "Дай короткий поисковый запрос для реальной фотографии к этой новости. Верни только JSON {\"query\":\"...\"}. Новость: " + title + " " + description[:700]
-    h={"Content-Type":"application/json"}
-    if AI_KEY: h["Authorization"]="Bearer "+AI_KEY
-    payload={"model":MODEL,"messages":[{"role":"user","content":prompt}],"stream":True}
-    parts=[]
-    async with httpx.AsyncClient(timeout=120) as cc:
-        async with cc.stream("POST",AI_URL,headers=h,json=payload) as rr:
-            rr.raise_for_status()
-            async for line in rr.aiter_lines():
-                if not line.startswith("data:"): continue
-                raw=line[5:].strip()
-                if raw=="[DONE]": break
-                try:
-                    ch=json.loads(raw).get("choices") or []
-                    if ch:
-                        p=(ch[0].get("delta") or {}).get("content")
-                        if isinstance(p,str): parts.append(p)
-                except json.JSONDecodeError: pass
-    m=re.search(r"\{[\s\S]*?\}","".join(parts))
-    if m:
-        try: return str(json.loads(m.group()).get("query") or title)
-        except Exception: pass
-    return title
-
-async def search_real_photo(item):
-    query=await ai_image_query(item["title"],item["description"])
-    urls=[]
-    try:
-        u="https://www.google.com/search?tbm=isch&q="+quote_plus(query)+"&hl=ru"
-        async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers=HEAD) as cc:
-            rr=await cc.get(u)
-        for m in re.finditer(r'https?://[^" ]+',rr.text,re.I):
-            u=html.unescape(m.group(0)).replace("\\/","/")
-            if any(x in u.lower() for x in ("google.com","gstatic.com","googleusercontent.com","favicon","logo")): continue
-            urls.append(u)
-            if len(urls)>=30: break
-    except Exception as e:
-        log.warning("image search failed: %s",e)
-    for u in urls:
-        try:
-            async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers=HEAD) as cc:
-                rr=await cc.get(u)
-            if not rr.headers.get("content-type","").startswith("image/") or len(rr.content)<20000: continue
-            im=Image.open(BytesIO(rr.content)); w,h=im.size
-            if w>=400 and h>=250 and .45<=w/h<=3.5:
-                return {"bytes":rr.content,"w":w,"h":h,"url":u}
-        except Exception: pass
-    return None
-
 def safe(s):
     return re.sub(r"<(?!/?(?:b|i)\b)[^>]*>","",str(s or ""),flags=re.I).strip()
 
@@ -215,30 +169,15 @@ async def publish():
     if not items: log.info("No new news candidates"); return False
     async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers=HEAD) as c:
         for x in items: await get_images(c,x)
-    r=await ai(items)
-    sid=r.get("id",0); sid=sid if isinstance(sid,int) and 0<=sid<len(items) else 0
-    selected=items[sid]
-    iid=r.get("image_id",0); iid=iid if isinstance(iid,int) and 0<=iid<len(selected["images"]) else 0
-    image=prepare_image(selected["images"][iid]["bytes"]) if selected["images"] else None
-    if image is None:
-        found=await search_real_photo(selected)
-        if found:
-            image=prepare_image(found["bytes"])
-            selected["images"].append(found)
-            iid=len(selected["images"])-1
-    if image is None:
-        for alt in items[:8]:
-            if alt is selected: continue
-            found=await search_real_photo(alt)
-            if found:
-                selected=alt
-                image=prepare_image(found["bytes"])
-                selected["images"].append(found)
-                iid=len(selected["images"])-1
-                break
-    if image is None:
-        log.warning("No real photo found; nothing published")
+    usable=[x for x in items if x["images"]]
+    if not usable:
+        log.warning("No article/RSS image found among %d candidates; nothing published",len(items))
         return False
+    r=await ai(usable)
+    sid=r.get("id",0); sid=sid if isinstance(sid,int) and 0<=sid<len(usable) else 0
+    selected=usable[sid]
+    iid=r.get("image_id",0); iid=iid if isinstance(iid,int) and 0<=iid<len(selected["images"]) else 0
+    image=prepare_image(selected["images"][iid]["bytes"])
     text=format_post(r)
     try:
         if image:
