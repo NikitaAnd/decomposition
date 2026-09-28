@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 from urllib.parse import quote_plus, urljoin
 import httpx
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageOps
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.types import BufferedInputFile
@@ -15,7 +15,7 @@ AI_URL=os.getenv("AI_URL","https://one-ai-openai-proxy-production.up.railway.app
 AI_KEY=os.getenv("AI_KEY",""); MODEL=os.getenv("MODEL","gpt-5"); NEWS_LIMIT=int(os.getenv("NEWS_LIMIT","12"))
 NEWS_QUERY=os.getenv("NEWS_QUERY","технологии OR искусственный интеллект OR Россия OR мир OR Minecraft OR игры")
 DB_PATH=os.getenv("DB_PATH","/tmp/newsbot.db"); bot=Bot(BOT_TOKEN)
-HEAD={"User-Agent":"Mozilla/5.0 (compatible; TelegramNewsBot/2.0)"}
+HEAD={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36"}
 SCHEMA="CREATE TABLE IF NOT EXISTS posted (key TEXT PRIMARY KEY,url TEXT,title TEXT,posted_at TEXT)"
 
 def db():
@@ -39,15 +39,18 @@ async def fetch_news():
         if not title or not link: continue
         k=hashlib.sha256(link.encode()).hexdigest()[:32]
         if posted(k): continue
-        m=re.search(r'<img[^>]+src=["\']([^"\']+)',desc_raw,re.I)
-        out.append({"key":k,"title":title,"url":link,"description":clean(desc_raw)[:1800],"date":x.findtext("pubDate") or "","image_urls":[html.unescape(m.group(1))] if m else [],"images":[]})
+        imgs=re.findall(r'<img[^>]+(?:src|data-src)=["\']([^"\']+)',desc_raw,re.I)
+        out.append({"key":k,"title":title,"url":link,"description":clean(desc_raw)[:1800],"date":x.findtext("pubDate") or "","image_urls":[html.unescape(u) for u in imgs],"images":[]})
         if len(out)>=NEWS_LIMIT: break
     return out
 
 def image_urls(page,base):
     found=[]
-    pats=[r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image(?::src)?)["\'][^>]+content=["\']([^"\']+)',
-          r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:image|twitter:image(?::src)?)["\']']
+    pats=[
+        r'<meta[^>]+(?:property|name)=["\'](?:og:image|og:image:url|twitter:image(?::src)?)["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:image|og:image:url|twitter:image(?::src)?)["\']',
+        r'<link[^>]+rel=["\'][^"\']*image_src[^"\']*["\'][^>]+href=["\']([^"\']+)'
+    ]
     for p in pats:
         found += [urljoin(base,html.unescape(m.group(1))) for m in re.finditer(p,page,re.I)]
     for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>',page,re.I):
@@ -55,44 +58,72 @@ def image_urls(page,base):
             d=json.loads(html.unescape(m.group(1))); stack=d if isinstance(d,list) else [d]
             for o in stack:
                 if not isinstance(o,dict): continue
-                v=o.get("image") or o.get("thumbnailUrl")
-                vals=v if isinstance(v,list) else [v]
-                for z in vals:
-                    if isinstance(z,dict): z=z.get("url")
-                    if isinstance(z,str): found.append(urljoin(base,z))
+                for key in ("image","thumbnailUrl","contentUrl"):
+                    v=o.get(key); vals=v if isinstance(v,list) else [v]
+                    for z in vals:
+                        if isinstance(z,dict): z=z.get("url") or z.get("contentUrl")
+                        if isinstance(z,str): found.append(urljoin(base,z))
         except Exception: pass
-    bad=("logo","favicon","avatar","icon","sprite","emoji")
-    return list(dict.fromkeys(u for u in found if u.startswith("http") and not any(b in u.lower() for b in bad)))[:12]
+    bad=("logo","favicon","avatar","icon","sprite","emoji","placeholder","default-image")
+    return list(dict.fromkeys(u for u in found if u.startswith("http") and not any(b in u.lower() for b in bad)))[:20]
 
 async def get_images(client,item):
     urls=list(item["image_urls"])
     try:
         r=await client.get(item["url"])
-        if r.status_code<400: urls += image_urls(r.text[:1200000],str(r.url))
-    except Exception: pass
-    for u in dict.fromkeys(urls):
+        if r.status_code<400: urls += image_urls(r.text[:2500000],str(r.url))
+    except Exception as e: log.warning("article fetch failed: %s",e)
+    seen=set()
+    for u in urls:
+        if u in seen: continue
+        seen.add(u)
         try:
             r=await client.get(u)
-            if r.status_code>=400 or not r.headers.get("content-type","").startswith("image/") or len(r.content)<15000: continue
+            ct=r.headers.get("content-type","").lower()
+            if r.status_code>=400 or not ct.startswith("image/") or len(r.content)<20000: continue
             im=Image.open(BytesIO(r.content)); w,h=im.size
-            if w>=500 and h>=300 and .65<=w/h<=3.2: item["images"].append({"bytes":r.content,"w":w,"h":h})
+            if w<600 or h<350 or not .55<=w/h<=2.5: continue
+            item["images"].append({"bytes":r.content,"w":w,"h":h,"url":u})
+            if len(item["images"])>=10: break
         except Exception: pass
-    item["images"]=item["images"][:8]
 
 async def ai(items):
-    candidates=[]
-    for i,x in enumerate(items):
-        candidates.append({"id":i,"title":x["title"],"description":x["description"][:900],"date":x["date"],
-                           "images":[{"id":j,"width":z["w"],"height":z["h"]} for j,z in enumerate(x["images"]) ]})
-    prompt="""Ты редактор Telegram-новостей. Выбери одну самую свежую и содержательно важную новость. Не выдумывай факты.
-Верни только JSON:
-{"id":0,"headline":"⚡️ короткий живой заголовок","lead":"1-2 предложения с <b>акцентами</b>","body":["абзац с <b>акцентами</b>"],"quote_lines":["🧡 Факт — <b>значение</b>"],"closing":"🧡 Короткий вывод с <b>акцентом</b>","poll_options":["❤️ — вариант","💩 — вариант","💩 — вариант"],"image_id":0}
-Правила: это должен быть живой Telegram-пост, не сухая статья. Жирным выделяй цифры, даты, суммы и ключевые детали. Если есть несколько условий/цифр — используй quote_lines. Всегда дай 3 poll_options. НЕ добавляй источник, URL, ссылки, название сайта или хэштеги. Только HTML-теги <b> и <i>. image_id — номер реальной картинки выбранной новости, начиная с 0.
+    candidates=[{"id":i,"title":x["title"],"description":x["description"][:1200],"date":x["date"],
+                 "images":[{"id":j,"width":z["w"],"height":z["h"]} for j,z in enumerate(x["images"])]}
+                for i,x in enumerate(items)]
+    prompt="""Ты редактор популярного Telegram-канала с новостями. Выбери одну новость и напиши пост ПРОСТЫМИ СЛОВАМИ, понятными любому человеку.
+
+Стиль:
+— Не сухая статья и не пресс-релиз.
+— Живой разговорный русский без канцелярита.
+— Заголовок должен цеплять и сразу говорить, что произошло.
+— Можно использовать 1 подходящий эмодзи в начале заголовка: ‼️ ⚡️ 🔥 🗿 😳 и т.п., но не ставь эмодзи случайно.
+— В заголовке выделяй <b>самое важное</b>: событие, человека, сумму, цифру.
+— 2–4 коротких абзаца. Каждый абзац — 1–3 предложения.
+— Не начинай абзацы словами «согласно данным», «стало известно», «эксперты отмечают», если без этого можно обойтись.
+— Пиши так, будто объясняешь новость другу.
+— Если есть важный итог, отдельный абзац начинай с «➖ » и выдели ключевую часть <b>жирным</b>.
+— Не делай списки и blockquote без реальной необходимости.
+— В конце дай 2 короткие реакции, естественные для этой новости. Можно использовать 💩, ❤️, 😡, 🔥 и т.п.
+— Не задавай вопрос «Как вам...».
+— Не выдумывай факты, причины, цитаты, диагнозы, травмы, суммы или детали.
+— Не упоминай источник, сайт, URL, хэштеги или название СМИ.
+— Не копируй формулировки из примера буквально.
+
+Верни ТОЛЬКО JSON:
+{"id":0,"headline":"‼️ <b>живой заголовок</b>","paragraphs":["абзац","абзац","➖ <b>главный итог</b>"],"reactions":["💩 *— реакция*","*❤️* *— реакция*"],"image_id":0}
+
+Картинка:
+— image_id должен указывать на реальную фотографию из списка images выбранной новости.
+— Выбирай фотографию, которая максимально связана с событием, а не логотип или баннер.
+— Если у новости нет подходящих images, выбери другую новость с images.
+— Никогда не выбирай несуществующий image_id.
+
 КАНДИДАТЫ:
 """+json.dumps(candidates,ensure_ascii=False)
-    h={"Content-Type":"application/json"}; 
+    h={"Content-Type":"application/json"}
     if AI_KEY: h["Authorization"]="Bearer "+AI_KEY
-    payload={"model":MODEL,"messages":[{"role":"system","content":"Ты профессиональный Telegram-редактор. Только валидный JSON."},{"role":"user","content":prompt}],"stream":True}
+    payload={"model":MODEL,"messages":[{"role":"system","content":"Ты профессиональный Telegram-редактор. Возвращай только валидный JSON без markdown-обёртки."},{"role":"user","content":prompt}],"stream":True}
     parts=[]
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20,read=180,write=30,pool=30)) as c:
         async with c.stream("POST",AI_URL,headers=h,json=payload) as r:
@@ -112,38 +143,20 @@ async def ai(items):
     return json.loads(m.group())
 
 def safe(s):
-    return re.sub(r"<(?!/?(?:b|i|blockquote)\b)[^>]*>","",str(s or ""),flags=re.I).strip()
+    return re.sub(r"<(?!/?(?:b|i)\b)[^>]*>","",str(s or ""),flags=re.I).strip()
 
 def format_post(r):
-    p=[f"<b>{safe(r.get('headline'))}</b>"]
-    if r.get("lead"): p.append(safe(r["lead"]))
-    p += [safe(x) for x in r.get("body",[]) if str(x).strip()][:4]
-    q=[safe(x) for x in r.get("quote_lines",[]) if str(x).strip()]
-    if q: p.append("<blockquote>"+"\n".join(q[:6])+"</blockquote>")
-    if r.get("closing"): p.append(safe(r["closing"]))
-    opts=[safe(x) for x in r.get("poll_options",[]) if str(x).strip()][:3]
-    if opts: p.append("\n".join("<i>"+x+"</i>" for x in opts))
+    p=[safe(r.get("headline"))]
+    p += [safe(x) for x in r.get("paragraphs",[]) if str(x).strip()][:4]
+    opts=[safe(x) for x in r.get("reactions",[]) if str(x).strip()][:2]
+    if opts: p.append("\n".join(opts))
     return "\n\n".join(p)
 
-def font(n):
-    try: return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",n)
-    except Exception: return ImageFont.load_default()
-
-def edit(raw,title):
-    if not raw:return None
+def prepare_image(raw):
+    if not raw: return None
     try:
-        im=ImageOps.fit(Image.open(BytesIO(raw)).convert("RGB"),(1280,720),method=Image.Resampling.LANCZOS); d=ImageDraw.Draw(im,"RGBA")
-        for y in range(470,720): d.line((0,y,1280,y),fill=(5,8,12,int(30+190*(y-470)/250)))
-        d.rectangle((0,470,10,720),fill=(178,250,114,255)); f=font(40); words=re.sub(r"<[^>]+>","",title or "").split(); lines=[]; line=""
-        for w in words:
-            t=(line+" "+w).strip()
-            if d.textbbox((0,0),t,font=f)[2]<=1120: line=t
-            else:
-                if line:lines.append(line)
-                line=w
-        if line:lines.append(line)
-        for i,l in enumerate(lines[:4]): d.text((48,515+i*46),l,font=f,fill="white",stroke_width=1,stroke_fill="black")
-        o=BytesIO(); im.save(o,"JPEG",quality=92,optimize=True); return o.getvalue()
+        im=ImageOps.fit(Image.open(BytesIO(raw)).convert("RGB"),(1280,720),method=Image.Resampling.LANCZOS)
+        o=BytesIO(); im.save(o,"JPEG",quality=94,optimize=True,progressive=True); return o.getvalue()
     except Exception: return None
 
 async def publish():
@@ -151,14 +164,23 @@ async def publish():
     if not items: log.info("No new news candidates"); return False
     async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers=HEAD) as c:
         for x in items: await get_images(c,x)
-    r=await ai(items); sid=r.get("id",0); sid=sid if 0<=sid<len(items) else 0; selected=items[sid]
-    iid=r.get("image_id",0); images=selected["images"]; iid=iid if isinstance(iid,int) and 0<=iid<len(images) else 0
-    image=edit(images[iid]["bytes"],r.get("headline")) if images else None
+    usable=[x for x in items if x["images"]]
+    if not usable:
+        log.warning("No candidate has a usable real image; nothing published")
+        return False
+    r=await ai(usable)
+    sid=r.get("id",0); sid=sid if isinstance(sid,int) and 0<=sid<len(usable) else 0
+    selected=usable[sid]
+    iid=r.get("image_id",0); iid=iid if isinstance(iid,int) and 0<=iid<len(selected["images"]) else 0
+    image=prepare_image(selected["images"][iid]["bytes"])
     text=format_post(r)
     try:
-        if image: await bot.send_photo(CHANNEL_ID,BufferedInputFile(image,filename="news.jpg"),caption=text,parse_mode=ParseMode.HTML)
-        else: await bot.send_message(CHANNEL_ID,text,parse_mode=ParseMode.HTML)
-        mark(selected); log.info("Published: %s",r.get("headline")); return True
+        if image:
+            await bot.send_photo(CHANNEL_ID,BufferedInputFile(image,filename="news.jpg"),caption=text,parse_mode=ParseMode.HTML)
+        else:
+            log.error("Selected image could not be prepared; skipping post")
+            return False
+        mark(selected); log.info("Published: %s | image=%s",r.get("headline"),selected["images"][iid]["url"]); return True
     except Exception: log.exception("Telegram publish failed"); return False
 
 async def main():
