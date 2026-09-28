@@ -147,31 +147,86 @@ def format_search_context(query, results):
 
 
 async def stream_ai_answer(user_id, content):
-    """Stream OpenAI-compatible SSE from Railway."""
+    """Stream OpenAI-compatible SSE, with JSON fallback for non-streaming proxies."""
     messages = contexts[user_id] + [{"role": "user", "content": content}]
-    headers = {"Authorization": f"Bearer {AI_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {AI_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream, application/json",
+    }
     payload = {"model": MODEL, "messages": messages, "stream": True}
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=180.0, write=30.0, pool=30.0)) as client:
-        async with client.stream("POST", AI_URL, headers=headers, json=payload) as r:
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=20.0, read=180.0, write=30.0, pool=30.0)
+    ) as client:
+        async with client.stream(
+            "POST", AI_URL, headers=headers, json=payload
+        ) as r:
             r.raise_for_status()
+
+            content_type = (r.headers.get("content-type") or "").lower()
+
+            # Some OpenAI-compatible proxies ignore stream=true and return
+            # one normal JSON response. Handle that case instead of silently
+            # producing an empty answer.
+            if "text/event-stream" not in content_type:
+                raw = await r.aread()
+                if not raw:
+                    return
+
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    logging.error(
+                        "AI proxy returned non-SSE response: %s",
+                        raw[:1000].decode("utf-8", errors="replace"),
+                    )
+                    return
+
+                choices = data.get("choices")
+                if isinstance(choices, list) and choices:
+                    choice = choices[0]
+                    message = choice.get("message", {})
+                    answer = (
+                        message.get("content")
+                        if isinstance(message, dict)
+                        else None
+                    )
+                    if answer is None:
+                        answer = choice.get("text")
+
+                    if isinstance(answer, str) and answer:
+                        yield answer
+                return
+
             async for line in r.aiter_lines():
                 line = line.strip()
                 if not line or line.startswith(":"):
                     continue
+
                 if line.startswith("data:"):
                     line = line[5:].strip()
+
                 if line == "[DONE]":
                     break
+
                 try:
                     data = json.loads(line)
                 except Exception:
                     continue
+
                 choices = data.get("choices")
                 if isinstance(choices, list) and choices:
                     delta = choices[0].get("delta", {})
-                    chunk = delta.get("content") if isinstance(delta, dict) else None
+                    chunk = (
+                        delta.get("content")
+                        if isinstance(delta, dict)
+                        else None
+                    )
+
                     if chunk is None:
                         chunk = choices[0].get("text")
+
                     if isinstance(chunk, str) and chunk:
                         yield chunk
 
