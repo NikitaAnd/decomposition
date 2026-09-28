@@ -1,5 +1,7 @@
 import os, asyncio, logging, base64, re
 from io import BytesIO
+from html.parser import HTMLParser
+from urllib.parse import quote_plus
 from PIL import Image
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, F
@@ -22,6 +24,7 @@ def keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="💬 Новый чат"), KeyboardButton(text="🧠 Контекст")],
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🔎 Поиск")],
             [KeyboardButton(text="ℹ️ Помощь")],
         ],
         resize_keyboard=True,
@@ -30,6 +33,81 @@ def keyboard():
 
 def clean_context(user_id):
     contexts[user_id] = contexts[user_id][-MAX_CONTEXT:]
+
+class DDGParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self.link = False
+        self.snippet = False
+        self.title = []
+        self.text = []
+        self.url = ""
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        cls = attrs.get("class", "")
+        if tag == "a" and "result__a" in cls:
+            self.link = True
+            self.title = []
+            self.url = attrs.get("href", "")
+        elif "result__snippet" in cls:
+            self.snippet = True
+            self.text = []
+
+    def handle_data(self, data):
+        if self.link:
+            self.title.append(data)
+        if self.snippet:
+            self.text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self.link:
+            title = " ".join("".join(self.title).split())
+            if title and self.url:
+                self.results.append({"title": title, "url": self.url, "snippet": ""})
+            self.link = False
+        elif self.snippet and tag in ("a", "div"):
+            if self.results:
+                self.results[-1]["snippet"] = " ".join("".join(self.text).split())
+            self.snippet = False
+
+
+async def web_search(query: str, limit: int = 5):
+    url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
+    headers = {"User-Agent": "Mozilla/5.0 (Android 16; Mobile) AppleWebKit/537.36 Chrome/140 Safari/537.36"}
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+    parser = DDGParser()
+    parser.feed(response.text)
+    out, seen = [], set()
+    for item in parser.results:
+        if item["url"] in seen:
+            continue
+        seen.add(item["url"])
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def search_trigger(text: str) -> bool:
+    text = text.lower().strip()
+    triggers = ("поищи ", "найди ", "гугли ", "загугли ", "что сейчас", "последние новости",
+                "актуальная информация", "в интернете", "посмотри в интернете")
+    return any(x in text for x in triggers)
+
+
+def format_search_context(query, results):
+    if not results:
+        return f"Интернет-поиск по запросу «{query}» ничего не вернул. Сообщи это пользователю и попроси уточнить запрос."
+    lines = [f"Результаты интернет-поиска по запросу: {query}",
+             "Используй эти результаты как внешний контекст. Не выдумывай сведения, которых в них нет.", ""]
+    for i, r in enumerate(results, 1):
+        lines += [f"[{i}] {r['title']}", f"URL: {r['url']}", f"Описание: {r['snippet']}", ""]
+    return "\n".join(lines)
+
 
 async def ask_ai(user_id, content):
     messages = contexts[user_id] + [{"role": "user", "content": content}]
@@ -44,6 +122,9 @@ async def ask_ai(user_id, content):
         {"role": "user", "content": content},
         {"role": "assistant", "content": answer},
     ])
+    user_stats[user_id]["messages"] += 1
+    if isinstance(content, list) and any(isinstance(p, dict) and p.get("type") == "image_url" for p in content):
+        user_stats[user_id]["images"] += 1
     clean_context(user_id)
     return answer
 
@@ -145,9 +226,15 @@ async def download_photo(message: Message) -> str:
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    contexts[message.from_user.id].clear()
+    user_id = message.from_user.id
+    contexts[user_id].clear()
+    user_stats[user_id] = {"messages": 0, "images": 0, "searches": 0}
+    search_mode[user_id] = False
+    name = message.from_user.first_name or "друг"
     await message.answer(
-        "🤖 <b>One AI</b>\n\nЯ готов. Пиши сообщение — я буду помнить контекст этого чата.",
+        f"🤖 <b>One AI</b>\n\nПривет, {name}! Я твой AI-помощник на GPT-5.\n\n"
+        "Я умею:\n• помнить контекст диалога\n• анализировать изображения и помнить их в текущем чате\n"
+        "• искать свежую информацию в интернете без отдельного API\n\nПросто напиши вопрос или отправь фотографию.",
         parse_mode="HTML", reply_markup=keyboard()
     )
 
@@ -160,6 +247,28 @@ async def new_chat(message: Message):
 async def context_info(message: Message):
     n = len(contexts[message.from_user.id])
     await message.answer(f"🧠 В памяти: <b>{n}</b> сообщений.", parse_mode="HTML", reply_markup=keyboard())
+
+@dp.message(F.text == "👤 Профиль")
+async def profile(message: Message):
+    user = message.from_user
+    stats = user_stats[user.id]
+    username = f"@{user.username}" if user.username else "не указан"
+    await message.answer(
+        f"👤 <b>Профиль</b>\n\nИмя: <b>{user.first_name or '—'}</b>\n"
+        f"Username: <b>{username}</b>\nID: <code>{user.id}</code>\n\n"
+        f"Сообщений: <b>{stats['messages']}</b>\nИзображений: <b>{stats['images']}</b>\n"
+        f"Поисков: <b>{stats['searches']}</b>",
+        parse_mode="HTML", reply_markup=keyboard()
+    )
+
+@dp.message(F.text == "🔎 Поиск")
+async def search_button(message: Message):
+    search_mode[message.from_user.id] = True
+    await message.answer(
+        "🔎 <b>Режим поиска включён.</b>\n\nОтправь ключевые слова или вопрос — "
+        "сначала выполню веб-поиск, затем передам результаты GPT-5.",
+        parse_mode="HTML", reply_markup=keyboard()
+    )
 
 @dp.message(F.text == "ℹ️ Помощь")
 async def help_cmd(message: Message):
