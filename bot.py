@@ -1,7 +1,5 @@
 import os, asyncio, logging, base64, re
 from io import BytesIO
-from html.parser import HTMLParser
-from urllib.parse import quote_plus
 from PIL import Image
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, F
@@ -34,87 +32,94 @@ def keyboard():
 def clean_context(user_id):
     contexts[user_id] = contexts[user_id][-MAX_CONTEXT:]
 
-class DDGParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.results = []
-        self.link = False
-        self.snippet = False
-        self.title = []
-        self.text = []
-        self.url = ""
+async def web_search(query: str, limit: int = 8):
+    """Keyless web/news search using public RSS feeds.
 
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        cls = attrs.get("class", "")
-        if tag == "a" and "result__a" in cls:
-            self.link = True
-            self.title = []
-            self.url = attrs.get("href", "")
-        elif "result__snippet" in cls:
-            self.snippet = True
-            self.text = []
+    Google News and Bing News RSS do not require a user API key. We merge,
+    deduplicate and normalize their results before sending them to GPT.
+    """
+    import xml.etree.ElementTree as ET
 
-    def handle_data(self, data):
-        if self.link:
-            self.title.append(data)
-        if self.snippet:
-            self.text.append(data)
+    feeds = [
+        (
+            "Google News",
+            "https://news.google.com/rss/search",
+            {
+                "q": query,
+                "hl": "ru",
+                "gl": "RU",
+                "ceid": "RU:ru",
+            },
+        ),
+        (
+            "Bing News",
+            "https://www.bing.com/news/search",
+            {"q": query, "format": "rss", "setlang": "ru-RU"},
+        ),
+    ]
 
-    def handle_endtag(self, tag):
-        if tag == "a" and self.link:
-            title = " ".join("".join(self.title).split())
-            if title and self.url:
-                self.results.append({"title": title, "url": self.url, "snippet": ""})
-            self.link = False
-        elif self.snippet and tag in ("a", "div"):
-            if self.results:
-                self.results[-1]["snippet"] = " ".join("".join(self.text).split())
-            self.snippet = False
-
-
-async def web_search(query: str, limit: int = 5):
-    # Public DuckDuckGo Instant Answer API; no API key required.
-    url = "https://api.duckduckgo.com/"
-    params = {"q": query, "format": "json", "no_html": 1, "no_redirect": 1, "skip_disambig": 0}
-    headers = {"User-Agent": "OneAI-Telegram-Bot/1.0"}
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
-        response = await client.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
+    headers = {"User-Agent": "Mozilla/5.0 OneAI-Telegram-Bot/1.0"}
     results = []
-    abstract = data.get("AbstractText")
-    if abstract:
-        results.append({
-            "title": data.get("Heading") or query,
-            "url": data.get("AbstractURL") or "https://duckduckgo.com/?q=" + quote_plus(query),
-            "snippet": abstract,
-        })
-    for topic in data.get("RelatedTopics", []):
-        items = topic.get("Topics", []) if isinstance(topic, dict) and isinstance(topic.get("Topics"), list) else [topic]
-        for item in items:
-            if isinstance(item, dict) and item.get("Text"):
+
+    async with httpx.AsyncClient(
+        timeout=15,
+        follow_redirects=True,
+        headers=headers,
+    ) as client:
+        for source, url, params in feeds:
+            try:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                root = ET.fromstring(response.text)
+            except Exception:
+                logging.exception("Search feed failed: %s", source)
+                continue
+
+            for item in root.findall(".//item"):
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                description = (item.findtext("description") or "").strip()
+                pub_date = (item.findtext("pubDate") or "").strip()
+
+                if not title or not link:
+                    continue
+
+                # RSS descriptions may contain HTML. Strip it before GPT sees it.
+                description = re.sub(r"<[^>]+>", " ", description)
+                description = re.sub(r"\\s+", " ", description).strip()
+
                 results.append({
-                    "title": item["Text"][:140],
-                    "url": item.get("FirstURL") or "https://duckduckgo.com/?q=" + quote_plus(query),
-                    "snippet": item["Text"],
+                    "title": title,
+                    "url": link,
+                    "snippet": description[:1000],
+                    "date": pub_date,
+                    "source": source,
                 })
-    unique, seen = [], set()
+
+    unique = []
+    seen = set()
     for item in results:
-        if item["url"] in seen:
+        key = item["url"].split("&utm_", 1)[0]
+        if key in seen:
             continue
-        seen.add(item["url"])
+        seen.add(key)
         unique.append(item)
         if len(unique) >= limit:
             break
+
     return unique
+
 
 def search_trigger(text: str) -> bool:
     text = text.lower().strip()
-    triggers = ("поищи ", "найди ", "гугли ", "загугли ", "что сейчас", "последние новости",
-                "актуальная информация", "в интернете", "посмотри в интернете")
+    triggers = (
+        "поищи", "найди", "гугли", "загугли", "поищем",
+        "новости", "новость", "последние новости", "свежие новости",
+        "что сейчас", "что нового", "актуальная информация",
+        "актуальные новости", "в интернете", "посмотри в интернете",
+        "найди в интернете", "поищи в интернете",
+    )
     return any(x in text for x in triggers)
-
 
 def format_search_context(query, results):
     if not results:
@@ -122,7 +127,16 @@ def format_search_context(query, results):
     lines = [f"Результаты интернет-поиска по запросу: {query}",
              "Используй эти результаты как внешний контекст. Не выдумывай сведения, которых в них нет.", ""]
     for i, r in enumerate(results, 1):
-        lines += [f"[{i}] {r['title']}", f"URL: {r['url']}", f"Описание: {r['snippet']}", ""]
+        date = f"Дата: {r['date']}" if r.get("date") else ""
+        source = f"Источник: {r['source']}" if r.get("source") else ""
+        lines += [
+            f"[{i}] {r['title']}",
+            f"URL: {r['url']}",
+            date,
+            source,
+            f"Описание: {r['snippet']}",
+            "",
+        ]
     return "\n".join(lines)
 
 
@@ -287,7 +301,7 @@ async def help_cmd(message: Message):
         "💡 <b>Команды</b>\n\n"
         "Просто отправь текст — получишь ответ GPT-5.\n"
         "💬 Новый чат — очистить память.\n"
-        "🧠 Контекст — посмотреть размер памяти.\n👤 Профиль — статистика.\n🔎 Поиск — интернет-поиск без API-ключа.",
+        "🧠 Контекст — посмотреть размер памяти.\n👤 Профиль — статистика.\n🔎 Поиск запускается автоматически, если в сообщении есть поисковый запрос или слова вроде «новости», «найди», «поищи».",
         parse_mode="HTML", reply_markup=keyboard()
     )
 
