@@ -69,7 +69,11 @@ async def set_banned(user_id, value):
 
 async def set_admin(user_id, value=True):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET is_admin=? WHERE user_id=?", (1 if value else 0, user_id))
+        await db.execute("""
+        INSERT INTO users(user_id, is_admin, created_at, last_seen)
+        VALUES(?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET is_admin=excluded.is_admin
+        """, (user_id, 1 if value else 0, now(), now()))
         await db.commit()
 
 async def add_message(user_id, role, content):
