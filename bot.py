@@ -291,7 +291,7 @@ async def stream_to_telegram(message: Message, user_id, content):
     full_text = ""
     last_sent = ""
     last_update = 0.0
-    interval = 0.9
+    interval = 0.65
 
     # Send a plain placeholder first. Do not attach a ReplyKeyboardMarkup to a
     # message that we are going to edit; the keyboard is already visible from
@@ -327,17 +327,27 @@ async def stream_to_telegram(message: Message, user_id, content):
 
         final_text = full_text.strip() or "Не удалось получить ответ."
 
-        # Remove the temporary streaming message and send the finished answer
-        # through the existing Rich Message/MarkdownV2 pipeline.
-        try:
-            await bot.delete_message(
-                chat_id=placeholder.chat.id,
-                message_id=placeholder.message_id,
-            )
-        except Exception:
-            logging.exception("Could not delete streaming placeholder")
+        # Flush the final part immediately so the streamed message visibly
+        # contains the complete answer before we do any formatting.
+        if final_text and final_text != last_sent and len(final_text) <= 4096:
+            try:
+                await edit_stream_text(final_text)
+                last_sent = final_text
+            except Exception as exc:
+                logging.warning("Final Telegram stream edit failed: %s", exc)
 
-        await send_ai_answer(message, final_text)
+        # Keep the same message for normal-sized answers. This makes the
+        # progressive stream visible instead of deleting it and sending a
+        # second message.
+        if len(final_text) > 4096:
+            try:
+                await bot.delete_message(
+                    chat_id=placeholder.chat.id,
+                    message_id=placeholder.message_id,
+                )
+            except Exception:
+                logging.warning("Could not delete streaming placeholder")
+            await send_ai_answer(message, final_text)
 
         contexts[user_id].extend([
             {"role": "user", "content": content},
