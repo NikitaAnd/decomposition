@@ -1,4 +1,4 @@
-import os, asyncio, logging, base64, re
+import os, asyncio, logging, base64, re, json
 from io import BytesIO
 from PIL import Image
 from collections import defaultdict
@@ -146,25 +146,34 @@ def format_search_context(query, results):
     return "\n".join(lines)
 
 
-async def ask_ai(user_id, content):
+async def stream_ai_answer(user_id, content):
+    """Stream OpenAI-compatible SSE from Railway."""
     messages = contexts[user_id] + [{"role": "user", "content": content}]
     headers = {"Authorization": f"Bearer {AI_KEY}", "Content-Type": "application/json"}
-    payload = {"model": MODEL, "messages": messages, "stream": False}
-    async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.post(AI_URL, headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
-    answer = data["choices"][0]["message"]["content"]
-    contexts[user_id].extend([
-        {"role": "user", "content": content},
-        {"role": "assistant", "content": answer},
-    ])
-    user_stats[user_id]["messages"] += 1
-    if isinstance(content, list) and any(isinstance(p, dict) and p.get("type") == "image_url" for p in content):
-        user_stats[user_id]["images"] += 1
-    clean_context(user_id)
-    return answer
-
+    payload = {"model": MODEL, "messages": messages, "stream": True}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=180.0, write=30.0, pool=30.0)) as client:
+        async with client.stream("POST", AI_URL, headers=headers, json=payload) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                line = line.strip()
+                if not line or line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line == "[DONE]":
+                    break
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
+                choices = data.get("choices")
+                if isinstance(choices, list) and choices:
+                    delta = choices[0].get("delta", {})
+                    chunk = delta.get("content") if isinstance(delta, dict) else None
+                    if chunk is None:
+                        chunk = choices[0].get("text")
+                    if isinstance(chunk, str) and chunk:
+                        yield chunk
 
 def escape_plain(value: str) -> str:
     reserved = r"_*[]()~`>#+-=|{}.!\\"
@@ -220,6 +229,46 @@ def markdown_to_telegram(text: str) -> str:
     result = "".join(out)
     result = result.replace(r"\*", "*").replace(r"\~", "~").replace(r"\_", "_")
     return result
+
+
+async def stream_to_telegram(message: Message, user_id, content):
+    """Show one progressively edited Telegram message."""
+    full_text = ""
+    last_sent = ""
+    last_update = 0.0
+    interval = 0.65
+    placeholder = await message.answer("▌", reply_markup=keyboard())
+    try:
+        async for chunk in stream_ai_answer(user_id, content):
+            full_text += chunk
+            now = asyncio.get_running_loop().time()
+            if now - last_update >= interval and full_text != last_sent:
+                display = full_text.strip() or "▌"
+                if len(display) <= 4096:
+                    try:
+                        await placeholder.edit_text(display, reply_markup=keyboard())
+                        last_sent = display
+                        last_update = now
+                    except Exception:
+                        logging.exception("Telegram stream edit failed")
+        final_text = full_text.strip() or "Не удалось получить ответ."
+        if len(final_text) <= 4096:
+            await placeholder.edit_text(final_text, reply_markup=keyboard())
+        else:
+            await placeholder.edit_text(final_text[:4096], reply_markup=keyboard())
+            await send_ai_answer(message, final_text[4096:])
+        contexts[user_id].extend([
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": final_text},
+        ])
+        user_stats[user_id]["messages"] += 1
+        if isinstance(content, list) and any(isinstance(p, dict) and p.get("type") == "image_url" for p in content):
+            user_stats[user_id]["images"] += 1
+        clean_context(user_id)
+        return final_text
+    except Exception:
+        logging.exception("AI streaming request failed")
+        raise
 
 
 async def send_ai_answer(message: Message, answer: str):
@@ -335,8 +384,7 @@ async def photo_message(message: Message):
             {"type": "text", "text": caption},
             {"type": "image_url", "image_url": {"url": image_url, "detail": "auto"}},
         ]
-        answer = await ask_ai(message.from_user.id, content)
-        await send_ai_answer(message, answer)
+        await stream_to_telegram(message, message.from_user.id, content)
     except Exception as e:
         logging.exception("Image AI request failed")
         await message.answer(f"❌ Ошибка: {e}", reply_markup=keyboard())
@@ -354,17 +402,15 @@ async def text_message(message: Message):
             results = await web_search(query)
             user_stats[user_id]["searches"] += 1
             search_context = format_search_context(query, results)
-            answer = await ask_ai(
-                user_id,
+            await stream_to_telegram(
+                message, user_id,
                 search_context + "\n\nОтветь на исходный запрос пользователя: " + query
             )
-            await send_ai_answer(message, answer)
 
             # Search results are already passed into GPT context; no extra system message is sent.
             return
 
-        answer = await ask_ai(user_id, query)
-        await send_ai_answer(message, answer)
+        await stream_to_telegram(message, user_id, query)
     except Exception as e:
         logging.exception("AI/search request failed")
         await message.answer(f"❌ Ошибка: {e}", reply_markup=keyboard())
