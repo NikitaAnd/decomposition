@@ -19,14 +19,12 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 contexts = defaultdict(list)
-search_mode = defaultdict(bool)
 user_stats = defaultdict(lambda: {"messages": 0, "images": 0, "searches": 0})
 
 def keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="💬 Новый чат"), KeyboardButton(text="🧠 Контекст")],
-            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🔎 Поиск")],
             [KeyboardButton(text="ℹ️ Помощь")],
         ],
         resize_keyboard=True,
@@ -76,23 +74,40 @@ class DDGParser(HTMLParser):
 
 
 async def web_search(query: str, limit: int = 5):
-    url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
-    headers = {"User-Agent": "Mozilla/5.0 (Android 16; Mobile) AppleWebKit/537.36 Chrome/140 Safari/537.36"}
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as client:
-        response = await client.get(url)
+    # Public DuckDuckGo Instant Answer API; no API key required.
+    url = "https://api.duckduckgo.com/"
+    params = {"q": query, "format": "json", "no_html": 1, "no_redirect": 1, "skip_disambig": 0}
+    headers = {"User-Agent": "OneAI-Telegram-Bot/1.0"}
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
+        response = await client.get(url, params=params)
         response.raise_for_status()
-    parser = DDGParser()
-    parser.feed(response.text)
-    out, seen = [], set()
-    for item in parser.results:
+        data = response.json()
+    results = []
+    abstract = data.get("AbstractText")
+    if abstract:
+        results.append({
+            "title": data.get("Heading") or query,
+            "url": data.get("AbstractURL") or "https://duckduckgo.com/?q=" + quote_plus(query),
+            "snippet": abstract,
+        })
+    for topic in data.get("RelatedTopics", []):
+        items = topic.get("Topics", []) if isinstance(topic, dict) and isinstance(topic.get("Topics"), list) else [topic]
+        for item in items:
+            if isinstance(item, dict) and item.get("Text"):
+                results.append({
+                    "title": item["Text"][:140],
+                    "url": item.get("FirstURL") or "https://duckduckgo.com/?q=" + quote_plus(query),
+                    "snippet": item["Text"],
+                })
+    unique, seen = [], set()
+    for item in results:
         if item["url"] in seen:
             continue
         seen.add(item["url"])
-        out.append(item)
-        if len(out) >= limit:
+        unique.append(item)
+        if len(unique) >= limit:
             break
-    return out
-
+    return unique
 
 def search_trigger(text: str) -> bool:
     text = text.lower().strip()
@@ -231,7 +246,6 @@ async def start(message: Message):
     user_id = message.from_user.id
     contexts[user_id].clear()
     user_stats[user_id] = {"messages": 0, "images": 0, "searches": 0}
-    search_mode[user_id] = False
     name = message.from_user.first_name or "друг"
     await message.answer(
         f"🤖 <b>One AI</b>\n\nПривет, {name}! Я твой AI-помощник на GPT-5.\n\n"
@@ -264,15 +278,6 @@ async def profile(message: Message):
         f"Username: <b>{username}</b>\nID: <code>{user.id}</code>\n\n"
         f"Сообщений: <b>{stats['messages']}</b>\nИзображений: <b>{stats['images']}</b>\n"
         f"Поисков: <b>{stats['searches']}</b>",
-        parse_mode="HTML", reply_markup=keyboard()
-    )
-
-@dp.message(F.text == "🔎 Поиск")
-async def search_button(message: Message):
-    search_mode[message.from_user.id] = True
-    await message.answer(
-        "🔎 <b>Режим поиска включён.</b>\n\nОтправь ключевые слова или вопрос — "
-        "сначала выполню веб-поиск, затем передам результаты GPT-5.",
         parse_mode="HTML", reply_markup=keyboard()
     )
 
@@ -309,11 +314,9 @@ async def text_message(message: Message):
         await bot.send_chat_action(message.chat.id, "typing")
         user_id = message.from_user.id
         query = message.text.strip()
-        do_search = search_mode[user_id] or search_trigger(query)
+        do_search = search_trigger(query)
 
         if do_search:
-            search_mode[user_id] = False
-            await message.answer("🔎 Ищу информацию в интернете…", reply_markup=keyboard())
             results = await web_search(query)
             user_stats[user_id]["searches"] += 1
             search_context = format_search_context(query, results)
@@ -323,17 +326,7 @@ async def text_message(message: Message):
             )
             await send_ai_answer(message, answer)
 
-            if results:
-                links = "\n".join(
-                    f'• <a href="{r["url"]}">{r["title"]}</a>'
-                    for r in results
-                )
-                await message.answer(
-                    "<b>Источники:</b>\n" + links,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                    reply_markup=keyboard(),
-                )
+            # Search results are already passed into GPT context; no extra system message is sent.
             return
 
         answer = await ask_ai(user_id, query)
