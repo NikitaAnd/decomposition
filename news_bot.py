@@ -142,6 +142,57 @@ async def ai(items):
     if not m: raise RuntimeError("GPT returned non-JSON")
     return json.loads(m.group())
 
+
+async def ai_image_query(title, description):
+    prompt = "Дай короткий поисковый запрос для реальной фотографии к этой новости. Верни только JSON {\"query\":\"...\"}. Новость: " + title + " " + description[:700]
+    h={"Content-Type":"application/json"}
+    if AI_KEY: h["Authorization"]="Bearer "+AI_KEY
+    payload={"model":MODEL,"messages":[{"role":"user","content":prompt}],"stream":True}
+    parts=[]
+    async with httpx.AsyncClient(timeout=120) as cc:
+        async with cc.stream("POST",AI_URL,headers=h,json=payload) as rr:
+            rr.raise_for_status()
+            async for line in rr.aiter_lines():
+                if not line.startswith("data:"): continue
+                raw=line[5:].strip()
+                if raw=="[DONE]": break
+                try:
+                    ch=json.loads(raw).get("choices") or []
+                    if ch:
+                        p=(ch[0].get("delta") or {}).get("content")
+                        if isinstance(p,str): parts.append(p)
+                except json.JSONDecodeError: pass
+    m=re.search(r"\{[\s\S]*?\}","".join(parts))
+    if m:
+        try: return str(json.loads(m.group()).get("query") or title)
+        except Exception: pass
+    return title
+
+async def search_real_photo(item):
+    query=await ai_image_query(item["title"],item["description"])
+    urls=[]
+    try:
+        u="https://www.google.com/search?tbm=isch&q="+quote_plus(query)+"&hl=ru"
+        async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers=HEAD) as cc:
+            rr=await cc.get(u)
+        for m in re.finditer(r'https?://[^" ]+',rr.text,re.I):
+            u=html.unescape(m.group(0)).replace("\\/","/")
+            if any(x in u.lower() for x in ("google.com","gstatic.com","googleusercontent.com","favicon","logo")): continue
+            urls.append(u)
+            if len(urls)>=30: break
+    except Exception as e:
+        log.warning("image search failed: %s",e)
+    for u in urls:
+        try:
+            async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers=HEAD) as cc:
+                rr=await cc.get(u)
+            if not rr.headers.get("content-type","").startswith("image/") or len(rr.content)<20000: continue
+            im=Image.open(BytesIO(rr.content)); w,h=im.size
+            if w>=400 and h>=250 and .45<=w/h<=3.5:
+                return {"bytes":rr.content,"w":w,"h":h,"url":u}
+        except Exception: pass
+    return None
+
 def safe(s):
     return re.sub(r"<(?!/?(?:b|i)\b)[^>]*>","",str(s or ""),flags=re.I).strip()
 
