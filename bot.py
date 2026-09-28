@@ -4,7 +4,7 @@ from PIL import Image
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup, InputRichMessage
 import httpx
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -217,25 +217,39 @@ def markdown_to_telegram(text: str) -> str:
 
 
 async def send_ai_answer(message: Message, answer: str):
-    """Convert GPT Markdown to Telegram MarkdownV2 and safely send long answers."""
-    converted = markdown_to_telegram(answer)
+    """Send GPT replies using Telegram Rich Messages, with MarkdownV2 fallback."""
+    text = str(answer).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    # Rich Messages support GitHub-style Markdown plus headings, lists,
+    # tables, blockquotes, spoilers, sub/superscript and LaTeX.
     chunks = []
-    while len(converted) > 4096:
-        cut = converted.rfind("\n", 0, 4096)
+    while len(text) > 4096:
+        cut = text.rfind("\n", 0, 4096)
         if cut < 2048:
-            cut = converted.rfind(" ", 0, 4096)
+            cut = text.rfind(" ", 0, 4096)
         if cut < 2048:
             cut = 4096
-        chunks.append(converted[:cut].rstrip())
-        converted = converted[cut:].lstrip()
-    if converted:
-        chunks.append(converted)
+        chunks.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    if text:
+        chunks.append(text)
+
     for chunk in chunks or [""]:
         try:
-            await message.answer(chunk, parse_mode="MarkdownV2", reply_markup=keyboard())
+            await bot.send_rich_message(
+                chat_id=message.chat.id,
+                rich_message=InputRichMessage(markdown=chunk),
+                reply_markup=keyboard(),
+            )
         except Exception:
-            logging.exception("MarkdownV2 failed; sending plain text")
-            await message.answer(re.sub(r"[*_~`]", "", chunk), reply_markup=keyboard())
+            logging.exception("Rich Message failed; falling back to MarkdownV2")
+            converted = markdown_to_telegram(chunk)
+            try:
+                await message.answer(converted, parse_mode="MarkdownV2", reply_markup=keyboard())
+            except Exception:
+                logging.exception("MarkdownV2 failed; sending plain text")
+                await message.answer(re.sub(r"[*_~`]", "", chunk), reply_markup=keyboard())
+
 def telegram_image_to_data_url(data: bytes) -> str:
     source = BytesIO(data)
     with Image.open(source) as image:
