@@ -19,6 +19,8 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 contexts = defaultdict(list)
+search_mode = defaultdict(bool)
+user_stats = defaultdict(lambda: {"messages": 0, "images": 0, "searches": 0})
 
 def keyboard():
     return ReplyKeyboardMarkup(
