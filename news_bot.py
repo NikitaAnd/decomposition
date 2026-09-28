@@ -149,12 +149,31 @@ image_id — индекс новости, чью картинку лучше и�
     payload = {"model": MODEL, "messages": [
         {"role": "system", "content": "Ты редактор новостей. Отвечай только валидным JSON."},
         {"role": "user", "content": prompt},
-    ], "stream": False}
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(AI_URL, headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
-    content = data["choices"][0]["message"]["content"]
+    ], "stream": True}
+    parts = []
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20, read=180, write=30, pool=30)) as client:
+        async with client.stream("POST", AI_URL, headers=headers, json=payload) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if raw == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(raw)
+                    choices = obj.get("choices") or []
+                    if choices:
+                        delta = choices[0].get("delta") or {}
+                        piece = delta.get("content")
+                        if isinstance(piece, str):
+                            parts.append(piece)
+                except json.JSONDecodeError:
+                    continue
+    content = "".join(parts)
+    if not content:
+        raise RuntimeError("GPT returned empty content")
     m = re.search(r"\{[\s\S]*\}", content)
     if not m:
         raise RuntimeError("GPT returned non-JSON")
