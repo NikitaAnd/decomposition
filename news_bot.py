@@ -14,6 +14,7 @@ import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from aiogram import Bot
 from aiogram.enums import ParseMode
+from aiogram.types import BufferedInputFile
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("news-bot")
@@ -257,7 +258,7 @@ async def publish():
     )
     try:
         if image:
-            await bot.send_photo(CHANNEL_ID, image, caption=text, parse_mode=ParseMode.HTML)
+            await bot.send_photo(CHANNEL_ID, BufferedInputFile(image, filename="news.jpg"), caption=text, parse_mode=ParseMode.HTML)
         else:
             await bot.send_message(CHANNEL_ID, text, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
         mark_posted(selected)
