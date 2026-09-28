@@ -213,21 +213,15 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
     if not request.messages:
         raise HTTPException(400, "messages cannot be empty")
 
-    # The native One AI endpoint is itself an SSE stream. We consume that stream
-    # internally and always return one normal OpenAI-compatible JSON response.
-    # This avoids exposing a second streaming layer to Telegram clients.
+    # One AI exposes an SSE endpoint. We consume it internally and expose only
+    # a normal OpenAI-compatible JSON response to clients.
     payload = make_payload(request)
     has_image = payload_has_image(payload)
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-        "Authorization": f"Bearer {make_jwt()}",
-        "user-header": make_user_header(),
-    }
     completion_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
     parts: list[str] = []
     upstream_completed = False
+    last_error: Exception | None = None
 
     log.info(
         "chat request: image=%s requested_stream=%s payload_bytes=%d",
@@ -236,78 +230,100 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
         len(json.dumps(payload, ensure_ascii=False).encode()),
     )
 
-    try:
-        timeout = httpx.Timeout(
-            connect=20.0,
-            read=180.0,
-            write=30.0,
-            pool=30.0,
-        )
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream(
-                "POST",
-                UPSTREAM_BASE + UPSTREAM_ENDPOINT,
-                json=payload,
-                headers=headers,
-            ) as response:
-                log.info(
-                    "upstream opened: image=%s status=%s content_type=%s",
-                    has_image,
-                    response.status_code,
-                    response.headers.get("content-type"),
-                )
+    timeout = httpx.Timeout(connect=20.0, read=75.0, write=30.0, pool=30.0)
 
-                if response.status_code >= 400:
-                    body = await response.aread()
-                    body_text = body.decode(errors="replace")[:4000]
-                    log.error(
-                        "upstream HTTP error: image=%s status=%s body=%s",
+    # The upstream occasionally kills an otherwise valid SSE connection at
+    # about 60 seconds before sending any data. Retry the complete request
+    # with a fresh JWT instead of immediately returning 502.
+    for attempt in range(1, 4):
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Authorization": f"Bearer {make_jwt()}",
+            "user-header": make_user_header(),
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "POST",
+                    UPSTREAM_BASE + UPSTREAM_ENDPOINT,
+                    json=payload,
+                    headers=headers,
+                ) as response:
+                    log.info(
+                        "upstream opened: attempt=%d image=%s status=%s content_type=%s",
+                        attempt,
                         has_image,
                         response.status_code,
-                        body_text,
-                    )
-                    raise HTTPException(
-                        502,
-                        f"Upstream HTTP {response.status_code}: {body_text}",
+                        response.headers.get("content-type"),
                     )
 
-                async for line in response.aiter_lines():
-                    stripped = line.strip()
-                    if stripped in ("data: [DONE]", "[DONE]"):
-                        upstream_completed = True
-                        continue
+                    if response.status_code >= 400:
+                        body = await response.aread()
+                        body_text = body.decode(errors="replace")[:4000]
+                        log.error(
+                            "upstream HTTP error: attempt=%d status=%s body=%s",
+                            attempt,
+                            response.status_code,
+                            body_text,
+                        )
+                        if attempt < 3:
+                            continue
+                        raise HTTPException(
+                            502,
+                            f"Upstream HTTP {response.status_code}: {body_text}",
+                        )
 
-                    text = parse_upstream(line)
-                    if text:
-                        parts.append(text)
+                    async for line in response.aiter_lines():
+                        stripped = line.strip()
+                        if stripped in ("data: [DONE]", "[DONE]"):
+                            upstream_completed = True
+                            continue
 
-                upstream_completed = True
+                        text = parse_upstream(line)
+                        if text:
+                            parts.append(text)
 
-    except HTTPException:
-        raise
-    except Exception as exc:
-        # One AI sometimes closes its chunked SSE response early. If we already
-        # received text, return it instead of converting a useful answer into 502.
-        if parts:
+                    upstream_completed = True
+                    break
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            last_error = exc
+            content_so_far = "".join(parts)
+
+            # If content was received, preserve it. If nothing was received,
+            # retry because this is the exact failure mode seen from the
+            # upstream: incomplete chunked read after ~60 seconds.
+            if content_so_far:
+                log.warning(
+                    "upstream ended early after %d chars on attempt %d; returning partial response: %s",
+                    len(content_so_far),
+                    attempt,
+                    exc,
+                )
+                break
+
             log.warning(
-                "upstream ended early after %d chars; returning partial response: %s",
-                len("".join(parts)),
+                "upstream attempt %d/%d failed with no content: %s",
+                attempt,
+                3,
                 exc,
             )
-        else:
-            log.exception("upstream exception with no content: image=%s", has_image)
-            raise HTTPException(
-                502,
-                f"Upstream request failed: {type(exc).__name__}: {exc}",
-            )
+            if attempt < 3:
+                await __import__("asyncio").sleep(1.0)
+                continue
 
     content = "".join(parts)
-    finish_reason = "stop" if upstream_completed else "length"
-
     if not content:
-        log.error("upstream returned no assistant content")
-        raise HTTPException(502, "Upstream returned an empty response")
+        error_text = f"{type(last_error).__name__}: {last_error}" if last_error else "empty upstream response"
+        log.error("upstream returned no assistant content after retries: %s", error_text)
+        raise HTTPException(502, f"Upstream request failed: {error_text}")
 
+    finish_reason = "stop" if upstream_completed else "length"
     log.info(
         "chat completed: image=%s chars=%d upstream_completed=%s",
         has_image,
@@ -322,10 +338,7 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
         "model": request.model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content,
-            },
+            "message": {"role": "assistant", "content": content},
             "finish_reason": finish_reason,
         }],
     }
