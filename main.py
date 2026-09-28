@@ -212,6 +212,10 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
     client_auth(authorization)
     if not request.messages:
         raise HTTPException(400, "messages cannot be empty")
+
+    # The native One AI endpoint is itself an SSE stream. We consume that stream
+    # internally and always return one normal OpenAI-compatible JSON response.
+    # This avoids exposing a second streaming layer to Telegram clients.
     payload = make_payload(request)
     has_image = payload_has_image(payload)
     headers = {
@@ -222,72 +226,110 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
     }
     completion_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
-    log.info("chat request: image=%s stream=%s payload_bytes=%d", has_image, request.stream, len(json.dumps(payload, ensure_ascii=False).encode()))
+    parts: list[str] = []
+    upstream_completed = False
 
-    if request.stream:
-        return StreamingResponse(
-            stream_upstream(request, payload, headers, completion_id, created),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
-        )
+    log.info(
+        "chat request: image=%s requested_stream=%s payload_bytes=%d",
+        has_image,
+        request.stream,
+        len(json.dumps(payload, ensure_ascii=False).encode()),
+    )
 
-    parts = []
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            async with client.stream("POST", UPSTREAM_BASE + UPSTREAM_ENDPOINT, json=payload, headers=headers) as response:
-                log.info("upstream opened: image=%s status=%s content_type=%s", has_image, response.status_code, response.headers.get("content-type"))
+        timeout = httpx.Timeout(
+            connect=20.0,
+            read=180.0,
+            write=30.0,
+            pool=30.0,
+        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream(
+                "POST",
+                UPSTREAM_BASE + UPSTREAM_ENDPOINT,
+                json=payload,
+                headers=headers,
+            ) as response:
+                log.info(
+                    "upstream opened: image=%s status=%s content_type=%s",
+                    has_image,
+                    response.status_code,
+                    response.headers.get("content-type"),
+                )
+
                 if response.status_code >= 400:
                     body = await response.aread()
                     body_text = body.decode(errors="replace")[:4000]
-                    log.error("upstream HTTP error: image=%s status=%s body=%s", has_image, response.status_code, body_text)
-                    raise HTTPException(502, f"Upstream HTTP {response.status_code}: {body_text}")
+                    log.error(
+                        "upstream HTTP error: image=%s status=%s body=%s",
+                        has_image,
+                        response.status_code,
+                        body_text,
+                    )
+                    raise HTTPException(
+                        502,
+                        f"Upstream HTTP {response.status_code}: {body_text}",
+                    )
+
                 async for line in response.aiter_lines():
+                    stripped = line.strip()
+                    if stripped in ("data: [DONE]", "[DONE]"):
+                        upstream_completed = True
+                        continue
+
                     text = parse_upstream(line)
                     if text:
                         parts.append(text)
+
+                upstream_completed = True
+
     except HTTPException:
         raise
     except Exception as exc:
-        log.exception("upstream exception: image=%s", has_image)
-        raise HTTPException(502, f"Upstream request failed: {type(exc).__name__}: {exc}")
+        # One AI sometimes closes its chunked SSE response early. If we already
+        # received text, return it instead of converting a useful answer into 502.
+        if parts:
+            log.warning(
+                "upstream ended early after %d chars; returning partial response: %s",
+                len("".join(parts)),
+                exc,
+            )
+        else:
+            log.exception("upstream exception with no content: image=%s", has_image)
+            raise HTTPException(
+                502,
+                f"Upstream request failed: {type(exc).__name__}: {exc}",
+            )
+
+    content = "".join(parts)
+    finish_reason = "stop" if upstream_completed else "length"
+
+    if not content:
+        log.error("upstream returned no assistant content")
+        raise HTTPException(502, "Upstream returned an empty response")
+
+    log.info(
+        "chat completed: image=%s chars=%d upstream_completed=%s",
+        has_image,
+        len(content),
+        upstream_completed,
+    )
 
     return {
-        "id": completion_id, "object": "chat.completion", "created": created, "model": request.model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(parts)}, "finish_reason": "stop"}],
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": request.model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": content,
+            },
+            "finish_reason": finish_reason,
+        }],
     }
 
-async def stream_upstream(request, payload, headers, completion_id, created) -> AsyncIterator[bytes]:
-    has_image = payload_has_image(payload)
-    yield sse({
-        "id": completion_id, "object": "chat.completion.chunk", "created": created, "model": request.model,
-        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-    })
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            async with client.stream("POST", UPSTREAM_BASE + UPSTREAM_ENDPOINT, json=payload, headers=headers) as response:
-                log.info("stream upstream opened: image=%s status=%s content_type=%s", has_image, response.status_code, response.headers.get("content-type"))
-                if response.status_code >= 400:
-                    body = await response.aread()
-                    body_text = body.decode(errors="replace")[:4000]
-                    log.error("stream upstream HTTP error: image=%s status=%s body=%s", has_image, response.status_code, body_text)
-                    yield sse({"error": {"message": f"Upstream HTTP {response.status_code}: {body_text}", "type": "upstream_error"}})
-                    yield b"data: [DONE]\n\n"
-                    return
-                async for line in response.aiter_lines():
-                    text = parse_upstream(line)
-                    if text:
-                        yield sse({
-                            "id": completion_id, "object": "chat.completion.chunk", "created": created, "model": request.model,
-                            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
-                        })
-    except Exception as exc:
-        log.exception("stream upstream exception: image=%s", has_image)
-        yield sse({"error": {"message": f"{type(exc).__name__}: {exc}", "type": "proxy_error"}})
-    yield sse({
-        "id": completion_id, "object": "chat.completion.chunk", "created": created, "model": request.model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    })
-    yield b"data: [DONE]\n\n"
 
 if __name__ == "__main__":
     import uvicorn
