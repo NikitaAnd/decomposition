@@ -133,28 +133,37 @@ def payload_has_image(payload: dict) -> bool:
     )
 
 def parse_upstream(line: str) -> str | None:
+    """Extract only actual assistant text from one upstream SSE line."""
     line = line.strip()
-    if not line or line == "data: [DONE]":
+    if not line or line.startswith(":"):
         return None
     if line.startswith("data:"):
         line = line[5:].strip()
-    if line == "[DONE]":
+    if not line or line == "[DONE]":
         return None
     try:
         obj = json.loads(line)
     except json.JSONDecodeError:
-        return line
+        # Never treat arbitrary SSE text/events as assistant content.
+        return None
+
     data = obj.get("data")
-    if isinstance(data, dict) and isinstance(data.get("content"), str):
-        return data["content"]
+    if isinstance(data, dict):
+        content = data.get("content")
+        if isinstance(content, str):
+            return content
+
     choices = obj.get("choices")
     if isinstance(choices, list) and choices:
         choice = choices[0]
         delta = choice.get("delta")
-        if isinstance(delta, dict) and isinstance(delta.get("content"), str):
-            return delta["content"]
-        if isinstance(choice.get("text"), str):
-            return choice["text"]
+        if isinstance(delta, dict):
+            content = delta.get("content")
+            if isinstance(content, str):
+                return content
+        content = choice.get("text")
+        if isinstance(content, str):
+            return content
     return None
 
 def sse(obj: dict) -> bytes:
@@ -270,6 +279,10 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
                                 f"Upstream HTTP {response.status_code}: {body_text}",
                             )
 
+                        chunk_count = 0
+                        stream_started = False
+                        stream_started_at = time.monotonic()
+
                         async for line in response.aiter_lines():
                             stripped = line.strip()
                             if not stripped:
@@ -282,6 +295,21 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
 
                             text = parse_upstream(line)
                             if text:
+                                chunk_count += 1
+                                if not stream_started:
+                                    stream_started = True
+                                    log.info(
+                                        "first upstream content chunk: image=%s elapsed=%.3fs",
+                                        has_image,
+                                        time.monotonic() - stream_started_at,
+                                    )
+                                log.info(
+                                    "upstream content chunk #%d: image=%s chars=%d preview=%r",
+                                    chunk_count,
+                                    has_image,
+                                    len(text),
+                                    text[:80],
+                                )
                                 yield (
                                     "data: "
                                     + json.dumps(
@@ -306,6 +334,13 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
                                     )
                                     + "\n\n"
                                 )
+
+                        log.info(
+                            "upstream stream closed: image=%s chunks=%d elapsed=%.3fs",
+                            has_image,
+                            chunk_count,
+                            time.monotonic() - stream_started_at,
+                        )
 
                         # Some upstream responses may close without an explicit
                         # [DONE]. Signal completion to OpenAI-compatible clients.
@@ -342,6 +377,11 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
                     3,
                     exc,
                 )
+                # Never replay a partial answer: that would duplicate text
+                # already delivered to the Telegram bot.
+                if "stream_started" in locals() and stream_started:
+                    log.error("stream failed after content started; not retrying")
+                    return
                 if attempt < 3:
                     await __import__("asyncio").sleep(1.0)
                     continue
