@@ -4,3 +4,4 @@ Pillow>=10,<13
 fastapi
 uvicorn
 pydantic
+aiosqlite>=0.20,<1
