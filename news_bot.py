@@ -198,11 +198,15 @@ def prepare_image(raw):
 async def publish():
     items=await fetch_news()
     if not items: log.info("No new news candidates"); return False
-    async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers=HEAD) as c:
-        for x in items: await get_images(c,x)
+    async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers=HEAD) as client:
+        for x in items:
+            await get_images(client,x)
+        missing=[x for x in items if not x["images"]][:15]
+        for x in missing:
+            x["images"]=await search_web_images(client,x)
     usable=[x for x in items if x["images"]]
     if not usable:
-        log.warning("No article/RSS image found among %d candidates; nothing published",len(items))
+        log.warning("No usable images found among %d candidates; nothing published",len(items))
         return False
     r=await ai(usable)
     sid=r.get("id",0); sid=sid if isinstance(sid,int) and 0<=sid<len(usable) else 0
@@ -211,13 +215,16 @@ async def publish():
     image=prepare_image(selected["images"][iid]["bytes"])
     text=format_post(r)
     try:
-        if image:
-            await bot.send_photo(CHANNEL_ID,BufferedInputFile(image,filename="news.jpg"),caption=text,parse_mode=ParseMode.HTML)
-        else:
+        if not image:
             log.error("Selected image could not be prepared; skipping post")
             return False
-        mark(selected); log.info("Published: %s | image=%s",r.get("headline"),selected["images"][iid]["url"]); return True
-    except Exception: log.exception("Telegram publish failed"); return False
+        await bot.send_photo(CHANNEL_ID,BufferedInputFile(image,filename="news.jpg"),caption=text,parse_mode=ParseMode.HTML)
+        mark(selected)
+        log.info("Published: %s | image=%s",r.get("headline"),selected["images"][iid]["url"])
+        return True
+    except Exception:
+        log.exception("Telegram publish failed")
+        return False
 
 async def main():
     db(); log.info("News bot job started: channel=%s model=%s",CHANNEL_ID,MODEL)
