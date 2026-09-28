@@ -87,13 +87,6 @@ async def get_images(client,item):
             if len(item["images"])>=10: break
         except Exception: pass
 
-async def image_search(query):
-    try:
-        r=await tools.mcp__Exa__web_search_exa({query:query+" news photo image",numResults:8,objective:"Find pages containing a real editorial/news photograph directly related to this event. Prefer article pages with a clear main image; exclude logos, icons, stock-photo collections, and unrelated images."})
-        return r
-    except Exception as e:
-        log.warning("image search failed: %s",e); return None
-
 async def ai(items):
     candidates=[{"id":i,"title":x["title"],"description":x["description"][:1200],"date":x["date"],
                  "images":[{"id":j,"width":z["w"],"height":z["h"]} for j,z in enumerate(x["images"])]}
