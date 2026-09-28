@@ -181,9 +181,26 @@ async def ai(items):
                         p=(ch[0].get("delta") or {}).get("content")
                         if isinstance(p,str): parts.append(p)
                 except json.JSONDecodeError: pass
-    m=re.search(r"\{[\s\S]*\}","".join(parts))
-    if not m: raise RuntimeError("GPT returned non-JSON")
-    return json.loads(m.group())
+    raw_text="".join(parts).strip()
+    if not raw_text:
+        raise RuntimeError("GPT returned empty response")
+    # GPT иногда оборачивает JSON в markdown или добавляет пояснение.
+    # Надёжно достаём первый валидный JSON-объект, не ломаясь на фигурных скобках внутри строк.
+    cleaned=re.sub(r"^\\s*\\`\\`\\`(?:json)?\\s*", "", raw_text, flags=re.I)
+    cleaned=re.sub(r"\\s*\\`\\`\\`\\s*$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        decoder=json.JSONDecoder()
+        for pos,ch in enumerate(cleaned):
+            if ch != "{": continue
+            try:
+                obj,_=decoder.raw_decode(cleaned[pos:])
+                if isinstance(obj,dict): return obj
+            except json.JSONDecodeError:
+                continue
+    log.error("GPT raw response (first 4000 chars): %s", raw_text[:4000])
+    raise RuntimeError("GPT returned non-JSON")
 
 
 def safe(s):
