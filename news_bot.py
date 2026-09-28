@@ -41,7 +41,7 @@ async def fetch_news():
         if posted(k): continue
         imgs=re.findall(r'<img[^>]+(?:src|data-src)=["\']([^"\']+)',desc_raw,re.I)
         out.append({"key":k,"title":title,"url":link,"description":clean(desc_raw)[:1800],"date":x.findtext("pubDate") or "","image_urls":[html.unescape(u) for u in imgs],"images":[]})
-        if len(out)>=NEWS_LIMIT: break
+        if len(out)>=max(40,NEWS_LIMIT): break
     return out
 
 def image_urls(page,base):
@@ -116,7 +116,7 @@ async def ai(items):
 Картинка:
 — image_id должен указывать на реальную фотографию из списка images выбранной новости.
 — Выбирай фотографию, которая максимально связана с событием, а не логотип или баннер.
-— Если у новости нет подходящих images, выбери другую новость с images.
+— Если у новости нет images, image_id поставь 0; бот сам найдёт фото отдельным поиском.
 — Никогда не выбирай несуществующий image_id.
 
 КАНДИДАТЫ:
@@ -215,15 +215,30 @@ async def publish():
     if not items: log.info("No new news candidates"); return False
     async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers=HEAD) as c:
         for x in items: await get_images(c,x)
-    usable=[x for x in items if x["images"]]
-    if not usable:
-        log.warning("No candidate has a usable real image; nothing published")
-        return False
-    r=await ai(usable)
-    sid=r.get("id",0); sid=sid if isinstance(sid,int) and 0<=sid<len(usable) else 0
-    selected=usable[sid]
+    r=await ai(items)
+    sid=r.get("id",0); sid=sid if isinstance(sid,int) and 0<=sid<len(items) else 0
+    selected=items[sid]
     iid=r.get("image_id",0); iid=iid if isinstance(iid,int) and 0<=iid<len(selected["images"]) else 0
-    image=prepare_image(selected["images"][iid]["bytes"])
+    image=prepare_image(selected["images"][iid]["bytes"]) if selected["images"] else None
+    if image is None:
+        found=await search_real_photo(selected)
+        if found:
+            image=prepare_image(found["bytes"])
+            selected["images"].append(found)
+            iid=len(selected["images"])-1
+    if image is None:
+        for alt in items[:8]:
+            if alt is selected: continue
+            found=await search_real_photo(alt)
+            if found:
+                selected=alt
+                image=prepare_image(found["bytes"])
+                selected["images"].append(found)
+                iid=len(selected["images"])-1
+                break
+    if image is None:
+        log.warning("No real photo found; nothing published")
+        return False
     text=format_post(r)
     try:
         if image:
