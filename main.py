@@ -303,13 +303,6 @@ async def chat_completions(request: ChatRequest, authorization: str | None = Hea
                                         has_image,
                                         time.monotonic() - stream_started_at,
                                     )
-                                log.info(
-                                    "upstream content chunk #%d: image=%s chars=%d preview=%r",
-                                    chunk_count,
-                                    has_image,
-                                    len(text),
-                                    text[:80],
-                                )
                                 yield (
                                     "data: "
                                     + json.dumps(
