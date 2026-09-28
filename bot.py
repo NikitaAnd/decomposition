@@ -22,8 +22,14 @@ user_stats = defaultdict(lambda: {"messages": 0, "images": 0, "searches": 0})
 def keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="💬 Новый чат"), KeyboardButton(text="🧠 Контекст")],
-            [KeyboardButton(text="ℹ️ Помощь")],
+            [
+                KeyboardButton(text="💬 Новый чат", style="primary"),
+                KeyboardButton(text="🧠 Контекст", style="primary"),
+            ],
+            [
+                KeyboardButton(text="👤 Профиль", style="success"),
+                KeyboardButton(text="ℹ️ Помощь", style="danger"),
+            ],
         ],
         resize_keyboard=True,
         is_persistent=True,
