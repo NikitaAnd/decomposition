@@ -246,16 +246,16 @@ async def stream_to_telegram(message: Message, user_id, content):
                 display = full_text.strip() or "▌"
                 if len(display) <= 4096:
                     try:
-                        await placeholder.edit_text(display, reply_markup=keyboard())
+                        await placeholder.edit_text(display)
                         last_sent = display
                         last_update = now
                     except Exception:
                         logging.exception("Telegram stream edit failed")
         final_text = full_text.strip() or "Не удалось получить ответ."
         if len(final_text) <= 4096:
-            await placeholder.edit_text(final_text, reply_markup=keyboard())
+            await placeholder.edit_text(final_text)
         else:
-            await placeholder.edit_text(final_text[:4096], reply_markup=keyboard())
+            await placeholder.edit_text(final_text[:4096])
             await send_ai_answer(message, final_text[4096:])
         contexts[user_id].extend([
             {"role": "user", "content": content},
