@@ -91,9 +91,40 @@ async def get_images(client,item):
             if len(item["images"])>=10: break
         except Exception: pass
 
+async def search_web_images(client, item):
+    query=clean(item["title"]+" "+item["description"][:500])
+    url="https://www.bing.com/images/search?q="+quote_plus(query)+"&form=HDRSC2&first=1"
+    try:
+        r=await client.get(url)
+        if r.status_code>=400: log.warning("Bing image search HTTP %s",r.status_code); return []
+        found=[]
+        for m in re.finditer(r'class="iusc"[^>]+m="([^"]+)"',r.text,re.I):
+            try:
+                meta=json.loads(html.unescape(m.group(1)))
+                u=meta.get("murl") or meta.get("turl")
+                if u and u.startswith("http"): found.append({"url":u,"context":meta.get("purl","")})
+            except Exception: pass
+        out=[]; seen=set()
+        for cand in found:
+            u=cand["url"]
+            if u in seen: continue
+            seen.add(u)
+            try:
+                rr=await client.get(u)
+                ct=rr.headers.get("content-type","").lower()
+                if rr.status_code>=400 or not ct.startswith("image/") or len(rr.content)<12000: continue
+                im=Image.open(BytesIO(rr.content)); w,h=im.size
+                if w<500 or h<300 or not .5<=w/h<=2.5: continue
+                out.append({"bytes":rr.content,"w":w,"h":h,"url":u,"context":cand["context"]})
+                if len(out)>=8: break
+            except Exception: pass
+        return out
+    except Exception as e:
+        log.warning("Bing image search failed: %s",e); return []
+
 async def ai(items):
     candidates=[{"id":i,"title":x["title"],"description":x["description"][:1200],"date":x["date"],
-                 "images":[{"id":j,"width":z["w"],"height":z["h"]} for j,z in enumerate(x["images"])]}
+                 "images":[{"id":j,"width":z["w"],"height":z["h"],"url":z["url"],"context":z.get("context","")} for j,z in enumerate(x["images"])]}
                 for i,x in enumerate(items)]
     prompt="""Ты редактор популярного Telegram-канала с новостями. Выбери одну новость и напиши пост ПРОСТЫМИ СЛОВАМИ, понятными любому человеку.
 
