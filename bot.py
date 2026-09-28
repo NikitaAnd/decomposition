@@ -236,8 +236,23 @@ async def stream_to_telegram(message: Message, user_id, content):
     full_text = ""
     last_sent = ""
     last_update = 0.0
-    interval = 0.65
-    placeholder = await message.answer("▌", reply_markup=keyboard())
+    interval = 0.9
+
+    # Send a plain placeholder first. Do not attach a ReplyKeyboardMarkup to a
+    # message that we are going to edit; the keyboard is already visible from
+    # the user's chat keyboard.
+    placeholder = await bot.send_message(
+        chat_id=message.chat.id,
+        text="▌",
+    )
+
+    async def edit_stream_text(text):
+        return await bot.edit_message_text(
+            chat_id=placeholder.chat.id,
+            message_id=placeholder.message_id,
+            text=text,
+        )
+
     try:
         async for chunk in stream_ai_answer(user_id, content):
             full_text += chunk
@@ -246,28 +261,50 @@ async def stream_to_telegram(message: Message, user_id, content):
                 display = full_text.strip() or "▌"
                 if len(display) <= 4096:
                     try:
-                        await placeholder.edit_text(display)
+                        await edit_stream_text(display)
                         last_sent = display
                         last_update = now
                     except Exception:
+                        # If Telegram rejects an edit, keep the request alive
+                        # and show the final answer normally instead of returning
+                        # a Telegram error to the user.
                         logging.exception("Telegram stream edit failed")
+
         final_text = full_text.strip() or "Не удалось получить ответ."
-        if len(final_text) <= 4096:
-            await placeholder.edit_text(final_text)
-        else:
-            await placeholder.edit_text(final_text[:4096])
-            await send_ai_answer(message, final_text[4096:])
+
+        # Remove the temporary streaming message and send the finished answer
+        # through the existing Rich Message/MarkdownV2 pipeline.
+        try:
+            await bot.delete_message(
+                chat_id=placeholder.chat.id,
+                message_id=placeholder.message_id,
+            )
+        except Exception:
+            logging.exception("Could not delete streaming placeholder")
+
+        await send_ai_answer(message, final_text)
+
         contexts[user_id].extend([
             {"role": "user", "content": content},
             {"role": "assistant", "content": final_text},
         ])
         user_stats[user_id]["messages"] += 1
-        if isinstance(content, list) and any(isinstance(p, dict) and p.get("type") == "image_url" for p in content):
+        if isinstance(content, list) and any(
+            isinstance(p, dict) and p.get("type") == "image_url"
+            for p in content
+        ):
             user_stats[user_id]["images"] += 1
         clean_context(user_id)
         return final_text
     except Exception:
         logging.exception("AI streaming request failed")
+        try:
+            await bot.delete_message(
+                chat_id=placeholder.chat.id,
+                message_id=placeholder.message_id,
+            )
+        except Exception:
+            pass
         raise
 
 
