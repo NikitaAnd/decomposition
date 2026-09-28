@@ -25,18 +25,21 @@ dp = Dispatcher()
 contexts = defaultdict(list)
 user_stats = defaultdict(lambda: {"messages": 0, "images": 0, "searches": 0})
 
-def keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="💬 Новый чат", style="primary"),
-                KeyboardButton(text="🧠 Контекст", style="primary"),
-            ],
-            [
-                KeyboardButton(text="👤 Профиль", style="success"),
-                KeyboardButton(text="ℹ️ Помощь", style="danger"),
-            ],
+def keyboard(user_id=None):
+    rows = [
+        [
+            KeyboardButton(text="💬 Новый чат", style="primary"),
+            KeyboardButton(text="🧠 Контекст", style="primary"),
         ],
+        [
+            KeyboardButton(text="👤 Профиль", style="success"),
+            KeyboardButton(text="ℹ️ Помощь", style="danger"),
+        ],
+    ]
+    if user_id == ADMIN_ID:
+        rows.append([KeyboardButton(text="🛠 Админ-панель", style="success")])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -430,16 +433,16 @@ async def send_ai_answer(message: Message, answer: str):
             await bot.send_rich_message(
                 chat_id=message.chat.id,
                 rich_message=InputRichMessage(markdown=chunk),
-                reply_markup=keyboard(),
+                reply_markup=keyboard(message.from_user.id),
             )
         except Exception:
             logging.exception("Rich Message failed; falling back to MarkdownV2")
             converted = markdown_to_telegram(chunk)
             try:
-                await message.answer(converted, parse_mode="MarkdownV2", reply_markup=keyboard())
+                await message.answer(converted, parse_mode="MarkdownV2", reply_markup=keyboard(message.from_user.id))
             except Exception:
                 logging.exception("MarkdownV2 failed; sending plain text")
-                await message.answer(re.sub(r"[*_~`]", "", chunk), reply_markup=keyboard())
+                await message.answer(re.sub(r"[*_~`]", "", chunk), reply_markup=keyboard(message.from_user.id))
 
 def telegram_image_to_data_url(data: bytes) -> str:
     source = BytesIO(data)
@@ -473,13 +476,13 @@ async def start(message: Message):
         f"🤖 <b>One AI</b>\n\nПривет, {name}! Я твой AI-помощник на GPT-5.\n\n"
         "Я умею:\n• помнить контекст диалога\n• анализировать изображения и помнить их в текущем чате\n"
         "• искать свежую информацию в интернете без отдельного API\n\nПросто напиши вопрос или отправь фотографию.",
-        parse_mode="HTML", reply_markup=keyboard()
+        parse_mode="HTML", reply_markup=keyboard(message.from_user.id)
     )
 
 @dp.message(F.text == "💬 Новый чат")
 async def new_chat(message: Message):
     contexts[message.from_user.id].clear()
-    await message.answer("🧹 Контекст очищен. Начинаем с чистого листа.", reply_markup=keyboard())
+    await message.answer("🧹 Контекст очищен. Начинаем с чистого листа.", reply_markup=keyboard(message.from_user.id))
 
 @dp.message(F.text == "🧠 Контекст")
 async def context_info(message: Message):
@@ -487,7 +490,7 @@ async def context_info(message: Message):
     images = user_stats[message.from_user.id]["images"]
     await message.answer(
         f"🧠 <b>Контекст</b>\n\nСообщений: <b>{n}</b>\nИзображений: <b>{images}</b>\nЛимит: <b>{MAX_CONTEXT}</b>",
-        parse_mode="HTML", reply_markup=keyboard()
+        parse_mode="HTML", reply_markup=keyboard(message.from_user.id)
     )
 
 @dp.message(F.text == "👤 Профиль")
@@ -500,7 +503,7 @@ async def profile(message: Message):
         f"Username: <b>{username}</b>\nID: <code>{user.id}</code>\n\n"
         f"Сообщений: <b>{stats['messages']}</b>\nИзображений: <b>{stats['images']}</b>\n"
         f"Поисков: <b>{stats['searches']}</b>",
-        parse_mode="HTML", reply_markup=keyboard()
+        parse_mode="HTML", reply_markup=keyboard(message.from_user.id)
     )
 
 @dp.message(F.text == "ℹ️ Помощь")
@@ -510,7 +513,7 @@ async def help_cmd(message: Message):
         "Просто отправь текст — получишь ответ GPT-5.\n"
         "💬 Новый чат — очистить память.\n"
         "🧠 Контекст — посмотреть размер памяти.\n👤 Профиль — статистика.\n🔎 Поиск запускается автоматически, если в сообщении есть поисковый запрос или слова вроде «новости», «найди», «поищи».",
-        parse_mode="HTML", reply_markup=keyboard()
+        parse_mode="HTML", reply_markup=keyboard(message.from_user.id)
     )
 
 @dp.message(F.photo)
@@ -529,12 +532,22 @@ async def photo_message(message: Message):
         await stream_to_telegram(message, message.from_user.id, content)
     except Exception as e:
         logging.exception("Image AI request failed")
-        await message.answer(f"❌ Ошибка: {e}", reply_markup=keyboard())
+        await message.answer(f"❌ Ошибка: {e}", reply_markup=keyboard(message.from_user.id))
+
+
+@dp.message(F.text == "🛠 Админ-панель")
+async def admin_button(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await admin_cmd(message)
 
 
 @dp.message(F.text)
 async def text_message(message: Message):
     try:
+        if message.from_user.id == ADMIN_ID and message.text == "/admin":
+            await admin_cmd(message)
+            return
         await db.upsert_user(message.from_user)
         if await db.is_banned(message.from_user.id):
             await message.answer("🚫 Доступ к боту ограничен.")
@@ -579,7 +592,7 @@ async def text_message(message: Message):
         await stream_to_telegram(message, user_id, query)
     except Exception as e:
         logging.exception("AI/search request failed")
-        await message.answer(f"❌ Ошибка: {e}", reply_markup=keyboard())
+        await message.answer(f"❌ Ошибка: {e}", reply_markup=keyboard(message.from_user.id))
 
 
 # ---------------- ADMIN PANEL ----------------
