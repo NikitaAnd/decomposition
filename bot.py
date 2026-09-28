@@ -246,7 +246,11 @@ async def new_chat(message: Message):
 @dp.message(F.text == "🧠 Контекст")
 async def context_info(message: Message):
     n = len(contexts[message.from_user.id])
-    await message.answer(f"🧠 В памяти: <b>{n}</b> сообщений.", parse_mode="HTML", reply_markup=keyboard())
+    images = user_stats[message.from_user.id]["images"]
+    await message.answer(
+        f"🧠 <b>Контекст</b>\n\nСообщений: <b>{n}</b>\nИзображений: <b>{images}</b>\nЛимит: <b>{MAX_CONTEXT}</b>",
+        parse_mode="HTML", reply_markup=keyboard()
+    )
 
 @dp.message(F.text == "👤 Профиль")
 async def profile(message: Message):
@@ -276,7 +280,7 @@ async def help_cmd(message: Message):
         "💡 <b>Команды</b>\n\n"
         "Просто отправь текст — получишь ответ GPT-5.\n"
         "💬 Новый чат — очистить память.\n"
-        "🧠 Контекст — посмотреть размер памяти.",
+        "🧠 Контекст — посмотреть размер памяти.\n👤 Профиль — статистика.\n🔎 Поиск — интернет-поиск без API-ключа.",
         parse_mode="HTML", reply_markup=keyboard()
     )
 
@@ -301,10 +305,39 @@ async def photo_message(message: Message):
 async def text_message(message: Message):
     try:
         await bot.send_chat_action(message.chat.id, "typing")
-        answer = await ask_ai(message.from_user.id, message.text)
+        user_id = message.from_user.id
+        query = message.text.strip()
+        do_search = search_mode[user_id] or search_trigger(query)
+
+        if do_search:
+            search_mode[user_id] = False
+            await message.answer("🔎 Ищу информацию в интернете…", reply_markup=keyboard())
+            results = await web_search(query)
+            user_stats[user_id]["searches"] += 1
+            search_context = format_search_context(query, results)
+            answer = await ask_ai(
+                user_id,
+                search_context + "\n\nОтветь на исходный запрос пользователя: " + query
+            )
+            await send_ai_answer(message, answer)
+
+            if results:
+                links = "\n".join(
+                    f'• <a href="{r["url"]}">{r["title"]}</a>'
+                    for r in results
+                )
+                await message.answer(
+                    "<b>Источники:</b>\n" + links,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=keyboard(),
+                )
+            return
+
+        answer = await ask_ai(user_id, query)
         await send_ai_answer(message, answer)
     except Exception as e:
-        logging.exception("AI request failed")
+        logging.exception("AI/search request failed")
         await message.answer(f"❌ Ошибка: {e}", reply_markup=keyboard())
 
 async def main():
