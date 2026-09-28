@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log=logging.getLogger("news-bot")
 BOT_TOKEN=os.environ["BOT_TOKEN"]; CHANNEL_ID=os.getenv("CHANNEL_ID","-1003884967892")
 AI_URL=os.getenv("AI_URL","https://one-ai-openai-proxy-production.up.railway.app/v1/chat/completions")
-AI_KEY=os.getenv("AI_KEY",""); MODEL=os.getenv("MODEL","gpt-5"); NEWS_LIMIT=int(os.getenv("NEWS_LIMIT","12"))
+AI_KEY=os.getenv("AI_KEY",""); MODEL=os.getenv("MODEL","gpt-5-mini"); NEWS_LIMIT=int(os.getenv("NEWS_LIMIT","12"))
 NEWS_QUERY=os.getenv("NEWS_QUERY","технологии OR искусственный интеллект OR Россия OR мир OR Minecraft OR игры")
 DB_PATH=os.getenv("DB_PATH","/tmp/newsbot.db"); bot=Bot(BOT_TOKEN)
 HEAD={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36"}
@@ -45,7 +45,7 @@ async def fetch_news():
                 u=tag.attrib.get("url") or tag.attrib.get("href")
                 if u: imgs.append(u)
         out.append({"key":k,"title":title,"url":link,"description":clean(desc_raw)[:1800],"date":x.findtext("pubDate") or "","image_urls":[html.unescape(u) for u in imgs],"images":[]})
-        if len(out)>=max(40,NEWS_LIMIT): break
+        if len(out)>=max(20,NEWS_LIMIT): break
     return out
 
 def image_urls(page,base):
@@ -88,7 +88,7 @@ async def get_images(client,item):
             im=Image.open(BytesIO(r.content)); w,h=im.size
             if w<200 or h<150 or not .45<=w/h<=3.5: continue
             item["images"].append({"bytes":r.content,"w":w,"h":h,"url":u})
-            if len(item["images"])>=10: break
+            if len(item["images"])>=5: break
         except Exception: pass
 
 async def search_web_images(client, item):
@@ -123,7 +123,7 @@ async def search_web_images(client, item):
         log.warning("Bing image search failed: %s",e); return []
 
 async def ai(items):
-    candidates=[{"id":i,"title":x["title"],"description":x["description"][:1200],"date":x["date"],
+    candidates=[{"id":i,"title":x["title"],"description":x["description"][:700],"date":x["date"],
                  "images":[{"id":j,"width":z["w"],"height":z["h"],"url":z["url"],"context":z.get("context","")} for j,z in enumerate(x["images"])]}
                 for i,x in enumerate(items)]
     prompt="""Ты редактор популярного Telegram-канала. Пиши ДОКУМЕНТАЛЬНО ТОЧНЫЕ новости простыми словами.
@@ -226,7 +226,7 @@ async def publish():
     async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers=HEAD) as client:
         for x in items:
             await get_images(client,x)
-        missing=[x for x in items if not x["images"]][:15]
+        missing=[x for x in items if not x["images"]][:8]
         for x in missing:
             x["images"]=await search_web_images(client,x)
     usable=[x for x in items if x["images"]]
