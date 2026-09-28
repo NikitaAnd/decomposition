@@ -287,66 +287,89 @@ def markdown_to_telegram(text: str) -> str:
 
 
 async def stream_to_telegram(message: Message, user_id, content):
-    """Show one progressively edited Telegram message."""
+    """Stream directly into the first real Telegram message, then finish with Rich formatting."""
     full_text = ""
     last_sent = ""
     last_update = 0.0
-    interval = 0.65
-
-    # Send a plain placeholder first. Do not attach a ReplyKeyboardMarkup to a
-    # message that we are going to edit; the keyboard is already visible from
-    # the user's chat keyboard.
-    placeholder = await bot.send_message(
-        chat_id=message.chat.id,
-        text="▌",
-    )
+    interval = 0.3
 
     async def edit_stream_text(text):
         return await bot.edit_message_text(
-            chat_id=placeholder.chat.id,
-            message_id=placeholder.message_id,
+            chat_id=message.chat.id,
+            message_id=stream_message.message_id,
             text=text,
         )
+
+    stream_message = None
 
     try:
         async for chunk in stream_ai_answer(user_id, content):
             full_text += chunk
             now = asyncio.get_running_loop().time()
-            if now - last_update >= interval and full_text != last_sent:
-                display = full_text.strip() or "▌"
-                if len(display) <= 4096:
-                    try:
-                        await edit_stream_text(display)
-                        last_sent = display
-                        last_update = now
-                    except Exception:
-                        # If Telegram rejects an edit, keep the request alive
-                        # and show the final answer normally instead of returning
-                        # a Telegram error to the user.
-                        logging.exception("Telegram stream edit failed")
+
+            # Send the first real chunk immediately — no placeholder like "▌".
+            if stream_message is None:
+                display = full_text
+                if display and len(display) <= 4096:
+                    stream_message = await bot.send_message(
+                        chat_id=message.chat.id,
+                        text=display,
+                    )
+                    last_sent = display
+                    last_update = now
+                continue
+
+            # While generating, update the same plain-text message every 0.3s.
+            if (
+                now - last_update >= interval
+                and full_text != last_sent
+                and len(full_text) <= 4096
+            ):
+                try:
+                    await edit_stream_text(full_text)
+                    last_sent = full_text
+                    last_update = now
+                except Exception:
+                    logging.exception("Telegram stream edit failed")
 
         final_text = full_text.strip() or "Не удалось получить ответ."
 
-        # Flush the final part immediately so the streamed message visibly
-        # contains the complete answer before we do any formatting.
-        if final_text and final_text != last_sent and len(final_text) <= 4096:
-            try:
-                await edit_stream_text(final_text)
-                last_sent = final_text
-            except Exception as exc:
-                logging.warning("Final Telegram stream edit failed: %s", exc)
+        # If the response was so fast that no chunk was sent yet, send it now.
+        if stream_message is None:
+            if len(final_text) <= 4096:
+                stream_message = await bot.send_message(
+                    chat_id=message.chat.id,
+                    text=final_text,
+                )
+            else:
+                await send_ai_answer(message, final_text)
+        elif len(final_text) <= 4096:
+            # Final plain-text flush, then replace it with the Rich Message.
+            if final_text != last_sent:
+                try:
+                    await edit_stream_text(final_text)
+                except Exception:
+                    logging.warning("Final Telegram stream edit failed")
 
-        # Keep the same message for normal-sized answers. This makes the
-        # progressive stream visible instead of deleting it and sending a
-        # second message.
-        if len(final_text) > 4096:
+            # Rich Messages cannot be edited with edit_message_text.
+            # Replace the temporary streamed text with the fully formatted answer.
             try:
                 await bot.delete_message(
-                    chat_id=placeholder.chat.id,
-                    message_id=placeholder.message_id,
+                    chat_id=stream_message.chat.id,
+                    message_id=stream_message.message_id,
                 )
             except Exception:
-                logging.warning("Could not delete streaming placeholder")
+                logging.warning("Could not delete streamed message before Rich Message")
+
+            await send_ai_answer(message, final_text)
+        else:
+            try:
+                await bot.delete_message(
+                    chat_id=stream_message.chat.id,
+                    message_id=stream_message.message_id,
+                )
+            except Exception:
+                logging.warning("Could not delete streamed message")
             await send_ai_answer(message, final_text)
 
         contexts[user_id].extend([
@@ -363,13 +386,14 @@ async def stream_to_telegram(message: Message, user_id, content):
         return final_text
     except Exception:
         logging.exception("AI streaming request failed")
-        try:
-            await bot.delete_message(
-                chat_id=placeholder.chat.id,
-                message_id=placeholder.message_id,
-            )
-        except Exception:
-            pass
+        if stream_message is not None:
+            try:
+                await bot.delete_message(
+                    chat_id=stream_message.chat.id,
+                    message_id=stream_message.message_id,
+                )
+            except Exception:
+                pass
         raise
 
 
