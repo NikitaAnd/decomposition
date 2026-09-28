@@ -4,13 +4,19 @@ from PIL import Image
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup, InputRichMessage
+from aiogram.types import (
+    Message, KeyboardButton, ReplyKeyboardMarkup, InputRichMessage,
+    InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery,
+)
+import database as db
 import httpx
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 AI_URL = os.getenv("AI_URL", "https://one-ai-openai-proxy-production.up.railway.app/v1/chat/completions")
 AI_KEY = os.environ["AI_KEY"]
 MODEL = os.getenv("MODEL", "gpt-5")
+ADMIN_ID = 8434278373
+admin_broadcast_mode = set()
 MAX_CONTEXT = int(os.getenv("MAX_CONTEXT", "20"))
 
 logging.basicConfig(level=logging.INFO)
@@ -372,15 +378,19 @@ async def stream_to_telegram(message: Message, user_id, content):
                 logging.warning("Could not delete streamed message")
             await send_ai_answer(message, final_text)
 
+        await db.add_message(user_id, "user", content)
+        await db.add_message(user_id, "assistant", final_text)
         contexts[user_id].extend([
             {"role": "user", "content": content},
             {"role": "assistant", "content": final_text},
         ])
+        await db.increment_stats(user_id, messages=1)
         user_stats[user_id]["messages"] += 1
         if isinstance(content, list) and any(
             isinstance(p, dict) and p.get("type") == "image_url"
             for p in content
         ):
+            await db.increment_stats(user_id, images=1)
             user_stats[user_id]["images"] += 1
         clean_context(user_id)
         return final_text
@@ -453,6 +463,9 @@ async def download_photo(message: Message) -> str:
 @dp.message(CommandStart())
 async def start(message: Message):
     user_id = message.from_user.id
+    await db.upsert_user(message.from_user)
+    if await db.is_banned(user_id):
+        return
     contexts[user_id].clear()
     user_stats[user_id] = {"messages": 0, "images": 0, "searches": 0}
     name = message.from_user.first_name or "друг"
@@ -503,6 +516,9 @@ async def help_cmd(message: Message):
 @dp.message(F.photo)
 async def photo_message(message: Message):
     try:
+        await db.upsert_user(message.from_user)
+        if await db.is_banned(message.from_user.id):
+            return
         await bot.send_chat_action(message.chat.id, "typing")
         image_url = await download_photo(message)
         caption = message.caption or "Проанализируй это изображение."
@@ -519,6 +535,29 @@ async def photo_message(message: Message):
 @dp.message(F.text)
 async def text_message(message: Message):
     try:
+        await db.upsert_user(message.from_user)
+        if await db.is_banned(message.from_user.id):
+            await message.answer("🚫 Доступ к боту ограничен.")
+            return
+        if message.from_user.id in admin_broadcast_mode:
+            if message.text == "/cancel":
+                admin_broadcast_mode.discard(message.from_user.id)
+                await message.answer("Рассылка отменена.")
+                return
+            admin_broadcast_mode.discard(message.from_user.id)
+            ids = await db.get_all_user_ids()
+            sent = failed = 0
+            for uid in ids:
+                try:
+                    await bot.send_message(uid, message.text)
+                    sent += 1
+                except Exception:
+                    failed += 1
+            await message.answer(
+                f"📢 Рассылка завершена.\n\n✅ Доставлено: <b>{sent}</b>\n❌ Ошибок: <b>{failed}</b>",
+                parse_mode="HTML"
+            )
+            return
         await bot.send_chat_action(message.chat.id, "typing")
         user_id = message.from_user.id
         query = message.text.strip()
@@ -527,6 +566,7 @@ async def text_message(message: Message):
         if do_search:
             results = await web_search(query)
             user_stats[user_id]["searches"] += 1
+            await db.increment_stats(user_id, searches=1)
             search_context = format_search_context(query, results)
             await stream_to_telegram(
                 message, user_id,
@@ -541,7 +581,162 @@ async def text_message(message: Message):
         logging.exception("AI/search request failed")
         await message.answer(f"❌ Ошибка: {e}", reply_markup=keyboard())
 
+
+# ---------------- ADMIN PANEL ----------------
+
+def admin_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats"),
+         InlineKeyboardButton(text="👥 Пользователи", callback_data="adm:users:0")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="adm:broadcast"),
+         InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:home")],
+    ])
+
+def admin_user_keyboard(user_id, banned):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🔓 Разбанить" if banned else "🚫 Забанить",
+            callback_data=f"adm:ban:{user_id}:{0 if banned else 1}"
+        )],
+        [InlineKeyboardButton(text="◀️ К пользователям", callback_data="adm:users:0")],
+    ])
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+@dp.message(Command("admin"))
+async def admin_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await db.upsert_user(message.from_user)
+    await db.set_admin(ADMIN_ID, True)
+    s = await db.stats()
+    await message.answer(
+        "🛠 <b>One AI — Админ-панель</b>\n\n"
+        f"👥 Пользователей: <b>{s['users']}</b>\n"
+        f"🟢 Активных за 24ч: <b>{s['active_24h']}</b>\n"
+        f"💬 Сообщений: <b>{s['messages']}</b>\n"
+        f"🖼 Изображений: <b>{s['images']}</b>\n"
+        f"🔎 Поисков: <b>{s['searches']}</b>\n"
+        f"🚫 Заблокировано: <b>{s['banned']}</b>",
+        parse_mode="HTML", reply_markup=admin_keyboard()
+    )
+
+@dp.callback_query(F.data == "adm:home")
+async def admin_home(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    s = await db.stats()
+    await call.message.edit_text(
+        "🛠 <b>One AI — Админ-панель</b>\n\n"
+        f"👥 Пользователей: <b>{s['users']}</b>\n"
+        f"🟢 Активных за 24ч: <b>{s['active_24h']}</b>\n"
+        f"💬 Сообщений: <b>{s['messages']}</b>\n"
+        f"🖼 Изображений: <b>{s['images']}</b>\n"
+        f"🔎 Поисков: <b>{s['searches']}</b>\n"
+        f"🚫 Заблокировано: <b>{s['banned']}</b>",
+        parse_mode="HTML", reply_markup=admin_keyboard()
+    )
+    await call.answer()
+
+@dp.callback_query(F.data == "adm:stats")
+async def admin_stats(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    s = await db.stats()
+    await call.answer(
+        f"Пользователи: {s['users']}\nАктивные 24ч: {s['active_24h']}\n"
+        f"Сообщения: {s['messages']}\nИзображения: {s['images']}\n"
+        f"Поиски: {s['searches']}\nБаны: {s['banned']}",
+        show_alert=True
+    )
+
+@dp.callback_query(F.data.startswith("adm:users:"))
+async def admin_users(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    offset = int(call.data.rsplit(":", 1)[1])
+    users = await db.list_users(offset, 8)
+    total = await db.user_count()
+    lines = ["👥 <b>Пользователи</b>", ""]
+    buttons = []
+    for u in users:
+        name = (u["first_name"] or "Без имени")[:24]
+        status = "🚫" if u["is_banned"] else "🟢"
+        lines.append(f"{status} <b>{name}</b> — <code>{u['user_id']}</code> — {u['messages']} сообщ.")
+        buttons.append([InlineKeyboardButton(text=f"{status} {name}", callback_data=f"adm:user:{u['user_id']}")])
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:users:{max(0, offset-8)}"))
+    if offset + 8 < total:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm:users:{offset+8}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adm:home")])
+    await call.message.edit_text(
+        "\n".join(lines) + f"\n\nСтраница {offset//8+1} • всего {total}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("adm:user:"))
+async def admin_user(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    uid = int(call.data.rsplit(":", 1)[1])
+    u = await db.get_user(uid)
+    if not u:
+        await call.answer("Пользователь не найден", show_alert=True)
+        return
+    name = " ".join(x for x in [u["first_name"], u["last_name"]] if x) or "—"
+    username = f"@{u['username']}" if u["username"] else "—"
+    text = (
+        "👤 <b>Пользователь</b>\n\n"
+        f"Имя: <b>{name}</b>\nUsername: <b>{username}</b>\nID: <code>{uid}</code>\n"
+        f"Статус: <b>{'ЗАБЛОКИРОВАН' if u['is_banned'] else 'активен'}</b>\n\n"
+        f"💬 Сообщений: <b>{u['messages']}</b>\n"
+        f"🖼 Изображений: <b>{u['images']}</b>\n"
+        f"🔎 Поисков: <b>{u['searches']}</b>\n"
+        f"Последняя активность: <code>{u['last_seen'][:19]}</code>"
+    )
+    await call.message.edit_text(text, parse_mode="HTML", reply_markup=admin_user_keyboard(uid, u["is_banned"]))
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("adm:ban:"))
+async def admin_ban(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    _, _, uid, value = call.data.split(":")
+    uid, value = int(uid), bool(int(value))
+    if uid == ADMIN_ID:
+        await call.answer("Себя заблокировать нельзя.", show_alert=True)
+        return
+    await db.set_banned(uid, value)
+    await call.answer("Пользователь заблокирован." if value else "Пользователь разблокирован.")
+    await admin_user(call)
+
+@dp.callback_query(F.data == "adm:broadcast")
+async def admin_broadcast(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    admin_broadcast_mode.add(call.from_user.id)
+    await call.message.answer(
+        "📢 <b>Режим рассылки</b>\n\n"
+        "Отправь следующим сообщением текст, который получат все незаблокированные пользователи.\n"
+        "Для отмены отправь /cancel.",
+        parse_mode="HTML"
+    )
+    await call.answer()
+
 async def main():
+    await db.init_db()
+    await db.set_admin(ADMIN_ID, True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
