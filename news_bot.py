@@ -270,13 +270,11 @@ async def publish():
 
 async def main():
     db()
-    log.info("News bot started: channel=%s interval=%sm model=%s", CHANNEL_ID, INTERVAL_MINUTES, MODEL)
-    while True:
-        try:
-            await publish()
-        except Exception:
-            log.exception("News cycle failed")
-        await asyncio.sleep(INTERVAL_MINUTES * 60)
+    log.info("News bot job started: channel=%s model=%s", CHANNEL_ID, MODEL)
+    try:
+        await publish()
+    except Exception:
+        log.exception("News cycle failed")
 
 if __name__ == "__main__":
     asyncio.run(main())
