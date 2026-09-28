@@ -82,7 +82,7 @@ async def get_images(client,item):
             ct=r.headers.get("content-type","").lower()
             if r.status_code>=400 or not ct.startswith("image/") or len(r.content)<20000: continue
             im=Image.open(BytesIO(r.content)); w,h=im.size
-            if w<600 or h<350 or not .55<=w/h<=2.5: continue
+            if w<200 or h<150 or not .45<=w/h<=3.5: continue
             item["images"].append({"bytes":r.content,"w":w,"h":h,"url":u})
             if len(item["images"])>=10: break
         except Exception: pass
