@@ -101,7 +101,7 @@ async def search_web_images(client, item):
         r=await client.get(url)
         if r.status_code>=400: log.warning("Bing image search HTTP %s",r.status_code); return []
         found=[]
-        for m in re.finditer(r'class=["']iusc["'][^>]+m=["']([^"']+)["']',r.text,re.I):
+        for m in re.finditer(r"class=['\"]iusc['\"][^>]+m=['\"]([^'\"]+)['\"]",r.text,re.I):
             try:
                 meta=json.loads(html.unescape(m.group(1)))
                 u=meta.get("murl") or meta.get("turl")
