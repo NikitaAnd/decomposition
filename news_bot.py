@@ -45,7 +45,7 @@ async def fetch_news():
                 u=tag.attrib.get("url") or tag.attrib.get("href")
                 if u: imgs.append(u)
         out.append({"key":k,"title":title,"url":link,"description":clean(desc_raw)[:1800],"date":x.findtext("pubDate") or "","image_urls":[html.unescape(u) for u in imgs],"images":[]})
-        if len(out)>=max(20,NEWS_LIMIT): break
+        if len(out)>=NEWS_LIMIT: break
     return out
 
 def image_urls(page,base):
@@ -88,11 +88,14 @@ async def get_images(client,item):
             im=Image.open(BytesIO(r.content)); w,h=im.size
             if w<200 or h<150 or not .45<=w/h<=3.5: continue
             item["images"].append({"bytes":r.content,"w":w,"h":h,"url":u})
-            if len(item["images"])>=5: break
+            if len(item["images"])>=4: break
         except Exception: pass
 
 async def search_web_images(client, item):
-    query=clean(item["title"]+" "+item["description"][:500])
+    query=clean(item["title"])
+    query=re.sub(r"\b(?:19|20)\d{2}\b"," ",query)
+    query=re.sub(r"\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b"," ",query)
+    query=clean(query)
     url="https://www.bing.com/images/search?q="+quote_plus(query)+"&form=HDRSC2&first=1"
     try:
         r=await client.get(url)
@@ -102,7 +105,12 @@ async def search_web_images(client, item):
             try:
                 meta=json.loads(html.unescape(m.group(1)))
                 u=meta.get("murl") or meta.get("turl")
-                if u and u.startswith("http"): found.append({"url":u,"context":meta.get("purl","")})
+                if u and u.startswith("http"): result_title=clean(meta.get("t",""))
+                title_tokens={x for x in re.findall(r"[a-zа-яё0-9]+",query.lower()) if len(x)>=4 and x not in {"новый","новые","новых","для","работы","работе","повседневных","дел","дела","сервис","сервисы","сервисов","искусственный","интеллект","ии","запустил","запустили","доступны","доступен"}}
+                result_tokens=set(re.findall(r"[a-zа-яё0-9]+",result_title.lower()))
+                if title_tokens and not (title_tokens & result_tokens):
+                    continue
+                found.append({"url":u,"context":meta.get("purl",""),"title":result_title})
             except Exception: pass
         out=[]; seen=set()
         for cand in found:
@@ -123,8 +131,7 @@ async def search_web_images(client, item):
         log.warning("Bing image search failed: %s",e); return []
 
 async def ai(items):
-    candidates=[{"id":i,"title":x["title"],"description":x["description"][:700],"date":x["date"],
-                 "images":[{"id":j,"width":z["w"],"height":z["h"],"url":z["url"],"context":z.get("context","")} for j,z in enumerate(x["images"])]}
+    candidates=[{"id":i,"title":x["title"],"description":x["description"][:1200],"date":x["date"]}
                 for i,x in enumerate(items)]
     prompt="""Ты редактор популярного Telegram-канала. Пиши ДОКУМЕНТАЛЬНО ТОЧНЫЕ новости простыми словами.
 
@@ -153,7 +160,7 @@ async def ai(items):
 Пример логики: если кандидат сообщает, что существует игра про побег из военкомата и даёт подтверждённые сведения об игре, сообщай именно о существовании игры, её сюжете и этих сведениях. Не превращай сюжет игры в реальную новость.
 
 Верни ТОЛЬКО JSON:
-{"id":0,"headline":"⚡️ <b>точный заголовок</b>","paragraphs":["короткий факт","ещё один подтверждённый факт","➖ <b>главный подтверждённый итог</b>"],"reactions":["😳 — реакция","🎮 — реакция"],"image_id":0}
+{"id":0,"headline":"⚡️ <b>живой точный заголовок</b>","paragraphs":["конкретный факт с деталями","ещё один конкретный факт","➖ <b>главный подтверждённый итог</b>"],"reactions":["🤖 — короткая живая реакция","🔥 — ещё одна живая реакция"]}
 
 
 Картинка:
@@ -166,7 +173,7 @@ async def ai(items):
 """+json.dumps(candidates,ensure_ascii=False)
     h={"Content-Type":"application/json"}
     if AI_KEY: h["Authorization"]="Bearer "+AI_KEY
-    payload={"model":MODEL,"messages":[{"role":"system","content":"Ты профессиональный Telegram-редактор. Возвращай только валидный JSON без markdown-обёртки."},{"role":"user","content":prompt}],"stream":True}
+    payload={"model":MODEL,"messages":[{"role":"system","content":"Ты профессиональный редактор Telegram-новостей. Возвращай только валидный JSON без markdown-обёртки."},{"role":"user","content":prompt}],"max_tokens":700,"stream":True}
     parts=[]
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20,read=180,write=30,pool=30)) as c:
         async with c.stream("POST",AI_URL,headers=h,json=payload) as r:
@@ -226,7 +233,7 @@ async def publish():
     async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers=HEAD) as client:
         for x in items:
             await get_images(client,x)
-        missing=[x for x in items if not x["images"]][:8]
+        missing=[x for x in items if not x["images"]][:6]
         for x in missing:
             x["images"]=await search_web_images(client,x)
     usable=[x for x in items if x["images"]]
@@ -236,7 +243,7 @@ async def publish():
     r=await ai(usable)
     sid=r.get("id",0); sid=sid if isinstance(sid,int) and 0<=sid<len(usable) else 0
     selected=usable[sid]
-    iid=r.get("image_id",0); iid=iid if isinstance(iid,int) and 0<=iid<len(selected["images"]) else 0
+    iid=0
     image=prepare_image(selected["images"][iid]["bytes"])
     text=format_post(r)
     try:
