@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log=logging.getLogger("news-bot")
 BOT_TOKEN=os.environ["BOT_TOKEN"]; CHANNEL_ID=os.getenv("CHANNEL_ID","-1003884967892")
 AI_URL=os.getenv("AI_URL","https://one-ai-openai-proxy-production.up.railway.app/v1/chat/completions")
-AI_KEY=os.getenv("AI_KEY",""); MODEL=os.getenv("MODEL","gpt-5-mini"); NEWS_LIMIT=int(os.getenv("NEWS_LIMIT","12"))
+AI_KEY=os.getenv("AI_KEY",""); MODEL=os.getenv("MODEL","gpt-5-mini"); NEWS_LIMIT=int(os.getenv("NEWS_LIMIT","8"))
 NEWS_QUERY=os.getenv("NEWS_QUERY","технологии OR искусственный интеллект OR Россия OR мир OR Minecraft OR игры")
 DB_PATH=os.getenv("DB_PATH","/tmp/newsbot.db"); bot=Bot(BOT_TOKEN)
 HEAD={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36"}
@@ -233,21 +233,29 @@ async def publish():
         log.info("No new news candidates")
         return False
 
-    async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers=HEAD) as client:
-        for x in items:
-            await get_images(client,x)
-        missing=[x for x in items if not x["images"] or all("googleusercontent.com" in z.get("url","") for z in x["images"])][:6]
-        for x in missing:
-            x["images"]=await search_web_images(client,x)
+    # Сначала выбираем новость. Не тратим время на загрузку картинок для всех кандидатов.
+    try:
+        r=await ai(items)
+    except Exception:
+        log.exception("AI selection failed; using first RSS candidate as fallback")
+        first=items[0]
+        r={
+            "id":0,
+            "headline":"📰 <b>"+html.escape(first["title"])+"</b>",
+            "paragraphs":[html.escape(first["description"][:700])],
+            "reactions":[]
+        }
 
-    log.info("News candidates=%d, with_images=%d",len(items),sum(bool(x["images"]) for x in items))
-
-    # Картинка НЕ является условием публикации.
-    # Сначала выбираем новость из всех кандидатов.
-    r=await ai(items)
     sid=r.get("id",0)
     sid=sid if isinstance(sid,int) and 0<=sid<len(items) else 0
     selected=items[sid]
+
+    # Картинку ищем ТОЛЬКО для уже выбранной новости.
+    async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers=HEAD) as client:
+        await get_images(client,selected)
+        if not selected["images"]:
+            selected["images"]=await search_web_images(client,selected)
+
     text=format_post(r)
 
     try:
@@ -260,13 +268,13 @@ async def publish():
                     caption=text,
                     parse_mode=ParseMode.HTML
                 )
-                log.info("Published with image: %s | image=%s",r.get("headline"),selected["images"][0]["url"])
+                log.info("Published with image: %s",r.get("headline"))
             else:
                 await bot.send_message(CHANNEL_ID,text,parse_mode=ParseMode.HTML,disable_web_page_preview=True)
-                log.info("Published text-only (image prepare failed): %s",r.get("headline"))
+                log.info("Published text-only: image prepare failed")
         else:
             await bot.send_message(CHANNEL_ID,text,parse_mode=ParseMode.HTML,disable_web_page_preview=True)
-            log.info("Published text-only (no image): %s",r.get("headline"))
+            log.info("Published text-only: no image")
 
         mark(selected)
         return True
