@@ -229,30 +229,46 @@ def prepare_image(raw):
 
 async def publish():
     items=await fetch_news()
-    if not items: log.info("No new news candidates"); return False
+    if not items:
+        log.info("No new news candidates")
+        return False
+
     async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers=HEAD) as client:
         for x in items:
             await get_images(client,x)
         missing=[x for x in items if not x["images"] or all("googleusercontent.com" in z.get("url","") for z in x["images"])][:6]
         for x in missing:
             x["images"]=await search_web_images(client,x)
-    usable=[x for x in items if x["images"]]
-    if not usable:
-        log.warning("No usable images found among %d candidates; nothing published",len(items))
-        return False
-    r=await ai(usable)
-    sid=r.get("id",0); sid=sid if isinstance(sid,int) and 0<=sid<len(usable) else 0
-    selected=usable[sid]
-    iid=0
-    image=prepare_image(selected["images"][iid]["bytes"])
+
+    log.info("News candidates=%d, with_images=%d",len(items),sum(bool(x["images"]) for x in items))
+
+    # Картинка НЕ является условием публикации.
+    # Сначала выбираем новость из всех кандидатов.
+    r=await ai(items)
+    sid=r.get("id",0)
+    sid=sid if isinstance(sid,int) and 0<=sid<len(items) else 0
+    selected=items[sid]
     text=format_post(r)
+
     try:
-        if not image:
-            log.error("Selected image could not be prepared; skipping post")
-            return False
-        await bot.send_photo(CHANNEL_ID,BufferedInputFile(image,filename="news.jpg"),caption=text,parse_mode=ParseMode.HTML)
+        if selected["images"]:
+            image=prepare_image(selected["images"][0]["bytes"])
+            if image:
+                await bot.send_photo(
+                    CHANNEL_ID,
+                    BufferedInputFile(image,filename="news.jpg"),
+                    caption=text,
+                    parse_mode=ParseMode.HTML
+                )
+                log.info("Published with image: %s | image=%s",r.get("headline"),selected["images"][0]["url"])
+            else:
+                await bot.send_message(CHANNEL_ID,text,parse_mode=ParseMode.HTML,disable_web_page_preview=True)
+                log.info("Published text-only (image prepare failed): %s",r.get("headline"))
+        else:
+            await bot.send_message(CHANNEL_ID,text,parse_mode=ParseMode.HTML,disable_web_page_preview=True)
+            log.info("Published text-only (no image): %s",r.get("headline"))
+
         mark(selected)
-        log.info("Published: %s | image=%s",r.get("headline"),selected["images"][iid]["url"])
         return True
     except Exception:
         log.exception("Telegram publish failed")
